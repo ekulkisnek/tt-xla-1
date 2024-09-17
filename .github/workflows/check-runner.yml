@@ -19,9 +19,9 @@ jobs:
     name: Check runner
     runs-on: ${{ matrix.build.runs-on }}
 
-    container:
-      image: ghcr.io/${{ github.repository }}/tt-mlir-base-ubuntu-22-04:latest
-      options: --user root
+    # container:
+    #   image: ghcr.io/tenstorrent/tt-mlir/tt-mlir-base-ubuntu-22-04:latest
+    #   options: --user root
 
     steps:
     - uses: actions/checkout@v4
