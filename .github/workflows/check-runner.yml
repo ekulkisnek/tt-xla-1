@@ -52,7 +52,7 @@ jobs:
         # Optional: Print hardware details using lshw (requires sudo)
         if command -v lshw &> /dev/null; then
             echo "Hardware Details (requires sudo):"
-            sudo lshw -short
+            sudo lshw -short || true
         else
             echo "lshw command not found. Install lshw for detailed hardware info."
         fi
