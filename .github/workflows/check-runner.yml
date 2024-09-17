@@ -1,0 +1,65 @@
+name: Check runner
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+
+jobs:
+  check-runners:
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        build: [
+          {runs-on: ubuntu-latest},
+          {runs-on: n300},
+          {runs-on: n150},
+        ]
+
+    name: Check runner
+    runs-on: ${{ matrix.build.runs-on }}
+
+    container:
+      image: ghcr.io/${{ github.repository }}/tt-mlir-base-ubuntu-22-04:latest
+      options: --user root
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Print machine info    
+      run: |
+        # Print machine name
+        echo "Machine Name: $(hostname)"
+
+        # Print OS information
+        echo "Operating System: $(lsb_release -d | cut -f2-)"
+        echo "Kernel Version: $(uname -r)"
+        echo "Architecture: $(uname -m)"
+
+        # Print current user
+        echo "Current User: $(whoami)"
+
+        # Print CPU information
+        echo "CPU Information:"
+        lscpu | grep 'Model name'
+        lscpu | grep 'Architecture'
+
+        # Print Memory information
+        echo "Memory Information:"
+        free -h
+
+        # Print Disk usage
+        echo "Disk Usage:"
+        df -h
+
+        # Print Network Interfaces
+        echo "Network Interfaces:"
+        ip addr show
+
+        # Optional: Print hardware details using lshw (requires sudo)
+        if command -v lshw &> /dev/null; then
+            echo "Hardware Details (requires sudo):"
+            sudo lshw -short
+        else
+            echo "lshw command not found. Install lshw for detailed hardware info."
+        fi
