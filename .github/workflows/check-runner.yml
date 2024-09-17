@@ -49,10 +49,6 @@ jobs:
         echo "Disk Usage:"
         df -h
 
-        # Print Network Interfaces
-        echo "Network Interfaces:"
-        ip addr show
-
         # Optional: Print hardware details using lshw (requires sudo)
         if command -v lshw &> /dev/null; then
             echo "Hardware Details (requires sudo):"
@@ -71,7 +67,8 @@ jobs:
           {runs-on: n150},
         ]
 
-    name: Check runner
+    name: Check runner docker
+    needs: check-runners-host
     runs-on: ${{ matrix.build.runs-on }}
 
     container:
@@ -106,10 +103,6 @@ jobs:
         # Print Disk usage
         echo "Disk Usage:"
         df -h
-
-        # Print Network Interfaces
-        echo "Network Interfaces:"
-        ip addr show
 
         # Optional: Print hardware details using lshw (requires sudo)
         if command -v lshw &> /dev/null; then
