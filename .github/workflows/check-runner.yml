@@ -49,14 +49,6 @@ jobs:
         echo "Disk Usage:"
         df -h
 
-        # Optional: Print hardware details using lshw (requires sudo)
-        if command -v lshw &> /dev/null; then
-            echo "Hardware Details (requires sudo):"
-            sudo lshw -short || true
-        else
-            echo "lshw command not found. Install lshw for detailed hardware info."
-        fi
-
   check-runners-docker:
     timeout-minutes: 10
     strategy:
@@ -103,11 +95,3 @@ jobs:
         # Print Disk usage
         echo "Disk Usage:"
         df -h
-
-        # Optional: Print hardware details using lshw (requires sudo)
-        if command -v lshw &> /dev/null; then
-            echo "Hardware Details (requires sudo):"
-            sudo lshw -short
-        else
-            echo "lshw command not found. Install lshw for detailed hardware info."
-        fi
