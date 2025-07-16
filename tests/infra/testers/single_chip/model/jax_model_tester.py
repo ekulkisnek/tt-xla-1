@@ -5,7 +5,9 @@
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import jax
+import os
 import shutil
+
 from huggingface_hub import snapshot_download
 from flax import linen, nnx
 from infra.comparators import ComparisonConfig
@@ -51,8 +53,9 @@ class JaxModelTester(ModelTester):
     def __del__(self):
         if hasattr(self, "_model_path"):
             cache_dir = snapshot_download(self._model_path, local_files_only=True)
-            print(f"Deleting cache at: {cache_dir}")
-            shutil.rmtree(cache_dir)
+            if cache_dir and os.path.exists(cache_dir):
+                print(f"Deleting cache at: {cache_dir}")
+                shutil.rmtree(cache_dir)
 
     def _get_static_argnames(self) -> Optional[Sequence[str]]:
         """

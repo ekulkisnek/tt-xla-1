@@ -24,6 +24,7 @@ from loguru import logger
 from pathlib import Path
 from typing import Any
 
+
 def pytest_configure(config: pytest.Config):
     """
     Registers custom pytest marker `record_test_properties(key1=val1, key2=val2, ...)`.
