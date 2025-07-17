@@ -91,14 +91,6 @@ jobs:
           echo "build=codecov" >> "$GITHUB_OUTPUT"
         else
           echo "build=release" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Debug log free memory
-      shell: bash
-      run: |
-        free -h
-        top -b -o %MEM | head -n 17
-        df -h
 
     - name: Download build artifacts
       if: steps.strings.outputs.do_codecov
