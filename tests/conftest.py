@@ -11,8 +11,6 @@ import gc
 import sys
 import threading
 import time
-import os
-import shutil
 
 import jax
 import psutil

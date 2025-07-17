@@ -91,6 +91,7 @@ jobs:
           echo "build=codecov" >> "$GITHUB_OUTPUT"
         else
           echo "build=release" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Download build artifacts
       if: steps.strings.outputs.do_codecov
