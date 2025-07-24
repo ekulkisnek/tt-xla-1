@@ -227,10 +227,10 @@ def extract_jax_layer0_components(test_input):
         num_key_value_heads = config.get('num_key_value_heads', num_heads)
         head_dim = hidden_size // num_heads
         
-        # Q, K, V projections (in bfloat16)
-        q = jnp.dot(normalized_input, attn_q_kernel.astype(jnp.bfloat16)) + attn_q_bias.astype(jnp.bfloat16)
-        k = jnp.dot(normalized_input, attn_k_kernel.astype(jnp.bfloat16)) + attn_k_bias.astype(jnp.bfloat16)
-        v = jnp.dot(normalized_input, attn_v_kernel.astype(jnp.bfloat16)) + attn_v_bias.astype(jnp.bfloat16)
+        # Q, K, V projections (in bfloat16) - weights now in PyTorch format, need transpose for computation
+        q = jnp.dot(normalized_input, attn_q_kernel.T.astype(jnp.bfloat16)) + attn_q_bias.astype(jnp.bfloat16)
+        k = jnp.dot(normalized_input, attn_k_kernel.T.astype(jnp.bfloat16)) + attn_k_bias.astype(jnp.bfloat16)
+        v = jnp.dot(normalized_input, attn_v_kernel.T.astype(jnp.bfloat16)) + attn_v_bias.astype(jnp.bfloat16)
         
         # Reshape for multi-head attention
         q = q.reshape(batch_size, seq_len, num_heads, head_dim)
@@ -288,8 +288,8 @@ def extract_jax_layer0_components(test_input):
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
         attn_output = attn_output.reshape(batch_size, seq_len, hidden_size)
         
-        # Output projection (in bfloat16)
-        attn_output = jnp.dot(attn_output, attn_o_kernel.astype(jnp.bfloat16))
+        # Output projection (in bfloat16) - weights in PyTorch format, need transpose
+        attn_output = jnp.dot(attn_output, attn_o_kernel.T.astype(jnp.bfloat16))
         if attn_o_bias is not None:
             attn_output = attn_output + attn_o_bias.astype(jnp.bfloat16)
         
@@ -305,10 +305,10 @@ def extract_jax_layer0_components(test_input):
         
         print(f"Step 4 - Post-attention normalization: {normalized_after_attn.shape}")
         
-        # Step 5: MLP (in bfloat16)
+        # Step 5: MLP (in bfloat16) - weights in PyTorch format, need transpose
         # Gate and up projections
-        gate = jnp.dot(normalized_after_attn, mlp_gate_kernel.astype(jnp.bfloat16))
-        up = jnp.dot(normalized_after_attn, mlp_up_kernel.astype(jnp.bfloat16))
+        gate = jnp.dot(normalized_after_attn, mlp_gate_kernel.T.astype(jnp.bfloat16))
+        up = jnp.dot(normalized_after_attn, mlp_up_kernel.T.astype(jnp.bfloat16))
         
         # SiLU activation on gate
         gate_activated = gate * jax.nn.sigmoid(gate)
@@ -317,7 +317,7 @@ def extract_jax_layer0_components(test_input):
         mlp_intermediate = gate_activated * up
         
         # Down projection
-        mlp_output = jnp.dot(mlp_intermediate, mlp_down_kernel.astype(jnp.bfloat16))
+        mlp_output = jnp.dot(mlp_intermediate, mlp_down_kernel.T.astype(jnp.bfloat16))
         
         print(f"Step 5 - MLP output: {mlp_output.shape}")
         

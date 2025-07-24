@@ -24,6 +24,7 @@ from typing import Dict, Any, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from flax import linen as nn
 from safetensors import safe_open
 
@@ -42,8 +43,13 @@ class QwenAttention(nn.Module):
         self.head_dim = c.get("head_dim", self.hidden_size // self.num_heads)
         self.num_kv_heads = c.get("num_key_value_heads", self.num_heads)
         self.kv_dim = self.num_kv_heads * self.head_dim
+        
+        # CRITICAL FIX: Define Dense layers to match PyTorch weight format (input, output)
+        # PyTorch Linear(in_features, out_features) -> JAX Dense(out_features)
+        # But with our transpose fix, weights are in PyTorch format (out, in)
+        # So we need to specify features to match the transposed PyTorch weights
         self.q_proj = nn.Dense(self.hidden_size, dtype=self.dtype, name="q_proj")
-        self.k_proj = nn.Dense(self.kv_dim, dtype=self.dtype, name="k_proj")
+        self.k_proj = nn.Dense(self.kv_dim, dtype=self.dtype, name="k_proj")  
         self.v_proj = nn.Dense(self.kv_dim, dtype=self.dtype, name="v_proj")
         self.o_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="o_proj")
         self.rope_theta = c.get("rope_theta", 10000.0)
@@ -328,6 +334,15 @@ def transpose_if_needed(name, param):
         return param
     if "layernorm.weight" in name or "norm.weight" in name:
         return param  # Don't transpose 1D layer norm weights
+    
+    # FINAL FIX: Transpose ALL projection weights for JAX Dense compatibility
+    # JAX Dense: output = input @ weight + bias
+    # PyTorch Linear: output = input @ weight.T + bias
+    # Therefore: JAX weight = PyTorch weight.T for ALL projections
+    if "self_attn" in name and "proj" in name and "weight" in name:
+        return jnp.transpose(param)  # Transpose ALL attention projections
+    
+    # Transpose other projection weights (MLP, lm_head)
     if "weight" in name and ("proj" in name or "lm_head" in name):
         return jnp.transpose(param)
     return param
@@ -336,7 +351,7 @@ def process_safetensors_file(file_path, dtype=jnp.bfloat16):
     flax_params = {"params": {}}
     unmapped_keys = []
     
-    with safe_open(file_path, framework="numpy") as f:
+    with safe_open(file_path, framework="pt") as f:
         for key in f.keys():
             param_path = get_param_path(key)
             if param_path is None:
@@ -347,11 +362,18 @@ def process_safetensors_file(file_path, dtype=jnp.bfloat16):
             original_dtype = param.dtype
             original_shape = param.shape
             
-            # Handle dtype conversion safely
-            if original_dtype == np.float16 and dtype == jnp.bfloat16:
-                param = param.astype(np.float32)  # safer than direct bf16 conversion
+            # Convert PyTorch tensor to numpy with proper dtype handling
+            if hasattr(param, 'detach'):
+                # Handle bfloat16 conversion properly 
+                if param.dtype == torch.bfloat16:
+                    param_np = param.detach().cpu().float().numpy()  # bfloat16 -> float32 -> numpy
+                else:
+                    param_np = param.detach().cpu().numpy()
+            else:
+                param_np = param
             
-            param = jnp.array(param, dtype=dtype)
+            # Handle dtype conversion with maximum precision preservation
+            param = jnp.array(param_np, dtype=dtype)
             param_before_transpose = param
             param = transpose_if_needed(key, param)
             
