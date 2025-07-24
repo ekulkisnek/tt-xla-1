@@ -24,13 +24,9 @@ def load_model_with_optimizations():
     print("Checking system memory...")
     available_gb = check_memory()
     
-    if available_gb < 8:
-        print(f"Warning: Only {available_gb:.1f} GB RAM available. 7B model typically needs 14+ GB.")
-        print("Falling back to smaller model...")
-        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    else:
-        print("Attempting to load Qwen2.5-7B-Instruct...")
-        model_name = "Qwen/Qwen2.5-7B-Instruct"
+    # Use local weights directory
+    model_name = "./weights"
+    print(f"Attempting to load Qwen2.5-7B-Instruct from local weights directory...")
     
     try:
         print(f"Loading {model_name}...")
@@ -62,18 +58,18 @@ def load_model_with_optimizations():
         print(f"Error loading {model_name}: {e}")
         print("Trying fallback model...")
         
-        # Fallback to smaller model
+        # Fallback to local weights with different settings
         try:
-            model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            print("Trying with different loading parameters...")
+            tokenizer = AutoTokenizer.from_pretrained("./weights")
             model = AutoModelForCausalLM.from_pretrained(
-                model_name,
+                "./weights",
                 torch_dtype=torch.float32,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
-            print(f"Successfully loaded fallback model: {model_name}")
-            return model, tokenizer, model_name
+            print(f"Successfully loaded model from local weights")
+            return model, tokenizer, "./weights"
         except Exception as e2:
             print(f"Error loading fallback model: {e2}")
             return None, None, None

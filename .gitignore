@@ -25,3 +25,6 @@ venv/*
 
 # Packaging scripts write artifacts here.
 bindist/
+
+# Model weights
+tests/jax/multi_chip/bounties/qwen2.5-7b/weights/
