@@ -25,3 +25,15 @@ venv/*
 
 # Packaging scripts write artifacts here.
 bindist/
+tests/jax/multi_chip/bounties/qwen25-7b/weights/model-00001-of-00004.safetensors
+.gitignore
+tests/jax/multi_chip/bounties/qwen25-7b/weights/model-00003-of-00004.safetensors
+.gitignore
+tests/jax/multi_chip/bounties/qwen25-7b/weights/model-00002-of-00004.safetensors
+
+/root/722fresh/tt-xla/tests/jax/multi_chip/bounties/qwen25-7b/weights
+/root/722fresh/tt-xla/tests/jax/multi_chip/bounties/qwen25-7b/weights/
+
+
+tests/jax/multi_chip/bounties/qwen25-7b/weights
+tests/jax/multi_chip/bounties/qwen25-7b/weights/
