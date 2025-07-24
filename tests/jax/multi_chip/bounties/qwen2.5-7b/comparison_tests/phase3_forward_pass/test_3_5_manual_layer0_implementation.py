@@ -241,11 +241,9 @@ def extract_jax_layer0_components(test_input):
         
         # Apply RoPE (keep in bfloat16)
         position_ids = jnp.arange(seq_len).reshape(1, seq_len)
-        # Temporarily disable RoPE to test if this is the issue
-        # q_rope, k_rope = manual_rope_jax(q, k, position_ids)
-        q_rope, k_rope = q, k  # Skip RoPE for debugging
+        q_rope, k_rope = manual_rope_jax(q, k, position_ids)
         
-        print(f"Step 2b - After RoPE (DISABLED): {q_rope.shape}, {k_rope.shape}")
+        print(f"Step 2b - After RoPE: {q_rope.shape}, {k_rope.shape}")
         
         # Attention computation (use mixed precision like PyTorch)
         # Transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
