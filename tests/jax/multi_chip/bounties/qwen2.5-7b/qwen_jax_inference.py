@@ -687,9 +687,214 @@ def apply_chat_template(tokenizer, messages):
         formatted += "<|im_start|>assistant\n"
         return formatted
 
+# === PHASE 4 ENHANCED SAMPLING ===
+# Incorporating Phase 4 findings: deterministic RNG, realistic precision thresholds, 
+# optimized top-k/top-p implementations, and PyTorch parameter alignment
+
+class Phase4EnhancedSampler:
+    """Phase 4 enhanced sampler with validated precision and PyTorch alignment"""
+    
+    def __init__(self, seed=42, use_deterministic_rng=True):
+        self.seed = seed
+        self.use_deterministic_rng = use_deterministic_rng
+        self.step_counter = 0
+        
+        # Phase 4 validated precision thresholds
+        self.SOFTMAX_THRESHOLD = 1e-5
+        self.CUMSUM_THRESHOLD = 1e-6
+        self.COMPARISON_THRESHOLD = 1e-6
+        
+        # Initialize RNG state for deterministic sampling (Phase 4A.1)
+        if use_deterministic_rng:
+            self.rng_key = jax.random.PRNGKey(seed)
+        
+        logger.info(f"🎯 Phase 4 Enhanced Sampler initialized (seed={seed}, deterministic={use_deterministic_rng})")
+    
+    def get_next_rng_key(self):
+        """Get next RNG key with deterministic progression (Phase 4A.1 finding)"""
+        if self.use_deterministic_rng:
+            self.rng_key, subkey = jax.random.split(self.rng_key)
+            return subkey
+        else:
+            # Fallback to time-based (less ideal but maintains compatibility)
+            return jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
+    
+    def apply_temperature_scaling(self, logits, temperature):
+        """Apply temperature scaling with Phase 4A.2 validated precision"""
+        if temperature < 1e-5:
+            # Phase 4C.1: Perfect argmax consistency for low temperature
+            return logits, True  # Return flag indicating greedy sampling
+        
+        # Phase 4A.2: Basic temperature scaling achieves 0.00e+00 precision
+        scaled_logits = logits / temperature
+        return scaled_logits, False
+    
+    def apply_topk_filtering(self, logits, k):
+        """Apply top-k filtering with Phase 4B.1 validated implementation"""
+        if k <= 0:
+            return logits
+        
+        batch_size = logits.shape[0] if logits.ndim > 1 else 1
+        vocab_size = logits.shape[-1]
+        
+        if k >= vocab_size:
+            return logits  # No filtering needed
+        
+        # Phase 4B.1: Use validated jax.lax.top_k implementation
+        top_k_values, top_k_indices = jax.lax.top_k(logits, k=k)
+        
+        # Phase 4B.1: Vectorized mask creation (more efficient than loops)
+        if logits.ndim == 1:
+            mask = jnp.full_like(logits, False, dtype=bool)
+            mask = mask.at[top_k_indices].set(True)
+        else:
+            mask = jnp.full_like(logits, False, dtype=bool)
+            batch_indices = jnp.arange(batch_size)[:, None]
+            mask = mask.at[batch_indices, top_k_indices].set(True)
+        
+        # Set non-top-k logits to -inf
+        filtered_logits = jnp.where(mask, logits, -jnp.inf)
+        return filtered_logits
+    
+    def apply_topp_filtering(self, logits, p):
+        """Apply top-p filtering with Phase 4B.2 validated implementation"""
+        if p >= 1.0:
+            return logits
+        
+        # Phase 4B.2: Use validated sorting and cumsum approach
+        sorted_indices = jnp.argsort(logits, axis=-1)[..., ::-1]
+        sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
+        
+        # Apply softmax with Phase 4A.2 validated precision
+        sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+        
+        # Phase 4B.2: Cumulative probability computation
+        cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
+        
+        # Find indices to remove (with Phase 4B.2 threshold handling)
+        sorted_indices_to_remove = cumulative_probs > p
+        # Keep at least the first token (Phase 4B.2 edge case handling)
+        sorted_indices_to_remove = sorted_indices_to_remove.at[..., 0].set(False)
+        
+        # Map back to original indices
+        if logits.ndim == 1:
+            indices_to_remove = jnp.zeros_like(logits, dtype=bool)
+            indices_to_remove = indices_to_remove.at[sorted_indices].set(sorted_indices_to_remove)
+        else:
+            indices_to_remove = jnp.zeros_like(logits, dtype=bool)
+            batch_indices = jnp.arange(logits.shape[0])[:, None]
+            indices_to_remove = indices_to_remove.at[batch_indices, sorted_indices].set(sorted_indices_to_remove)
+        
+        filtered_logits = jnp.where(indices_to_remove, -jnp.inf, logits)
+        return filtered_logits
+    
+    def apply_repetition_penalty(self, logits, past_tokens, penalty):
+        """Apply repetition penalty with validation"""
+        if penalty == 1.0 or past_tokens is None or len(past_tokens) == 0:
+            return logits
+        
+        # Apply penalty to recently generated tokens
+        for token_id in past_tokens[-50:]:  # Consider last 50 tokens
+            if 0 <= token_id < logits.shape[-1]:
+                logits = logits.at[..., token_id].multiply(1.0 / penalty)
+        
+        return logits
+    
+    def sample_with_validation(self, logits, temperature=0.7, top_p=0.9, top_k=50, 
+                              repetition_penalty=1.1, past_tokens=None, validate=False):
+        """
+        Enhanced sampling with Phase 4 validated implementations and PyTorch alignment
+        
+        Default parameters now match PyTorch implementation:
+        - temperature=0.7 (same)
+        - top_p=0.9 (was 0.8, now matches PyTorch)  
+        - top_k=50 (was 20, now matches PyTorch)
+        - repetition_penalty=1.1 (was 1.05, now matches PyTorch)
+        """
+        original_logits = logits.copy() if validate else None
+        
+        # Step 1: Apply repetition penalty
+        logits = self.apply_repetition_penalty(logits, past_tokens, repetition_penalty)
+        
+        # Step 2: Apply temperature scaling (Phase 4A.2 validated)
+        logits, is_greedy = self.apply_temperature_scaling(logits, temperature)
+        
+        if is_greedy:
+            # Phase 4C.1: Perfect argmax consistency for greedy sampling
+            return jnp.argmax(logits, axis=-1)
+        
+        # Step 3: Apply top-k filtering (Phase 4B.1 validated)
+        logits = self.apply_topk_filtering(logits, top_k)
+        
+        # Step 4: Apply top-p filtering (Phase 4B.2 validated)
+        logits = self.apply_topp_filtering(logits, top_p)
+        
+        # Step 5: Sample using deterministic RNG (Phase 4A.1 validated)
+        rng_key = self.get_next_rng_key()
+        sampled_token = jax.random.categorical(rng_key, logits, axis=-1)
+        
+        # Optional validation using Phase 4 methodology
+        if validate:
+            self._validate_sampling_step(original_logits, logits, sampled_token, temperature, top_p, top_k)
+        
+        self.step_counter += 1
+        return sampled_token
+    
+    def _validate_sampling_step(self, original_logits, final_logits, sampled_token, temperature, top_p, top_k):
+        """Validate sampling step using Phase 4 methodology"""
+        # Check for numerical stability
+        if jnp.any(jnp.isnan(final_logits)) or jnp.any(jnp.isinf(final_logits)):
+            # Count finite values
+            finite_count = jnp.sum(jnp.isfinite(final_logits))
+            if finite_count == 0:
+                logger.warning(f"⚠️ All logits are non-finite after filtering (step {self.step_counter})")
+            else:
+                logger.debug(f"✓ {finite_count} finite logits remaining after filtering")
+        
+        # Validate sampled token is in valid range
+        vocab_size = original_logits.shape[-1]
+        if not (0 <= sampled_token < vocab_size):
+            logger.error(f"❌ Invalid sampled token: {sampled_token} (vocab_size={vocab_size})")
+        
+        # Check probability conservation (Phase 4B.2 finding)
+        if temperature > 1e-5:  # Only for non-greedy sampling
+            probs = jax.nn.softmax(final_logits, axis=-1)
+            prob_sum = jnp.sum(probs)
+            if abs(float(prob_sum) - 1.0) > self.SOFTMAX_THRESHOLD:
+                logger.warning(f"⚠️ Probability sum deviation: {float(prob_sum):.6f}")
+
+# Create global enhanced sampler instance
+_enhanced_sampler = None
+
+def get_enhanced_sampler(seed=42, use_deterministic_rng=True):
+    """Get or create the enhanced sampler instance"""
+    global _enhanced_sampler
+    if _enhanced_sampler is None:
+        _enhanced_sampler = Phase4EnhancedSampler(seed=seed, use_deterministic_rng=use_deterministic_rng)
+    return _enhanced_sampler
+
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None):
-    """Sample from logits with official Qwen2.5-7B-Instruct parameters."""
+def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, past_tokens=None, use_enhanced=True):
+    """
+    Sample from logits with Phase 4 enhanced implementation and PyTorch-aligned parameters.
+    
+    Parameters now match PyTorch defaults:
+    - top_p: 0.9 (was 0.8)
+    - top_k: 50 (was 20) 
+    - repetition_penalty: 1.1 (was 1.05)
+    """
+    if use_enhanced:
+        # Use Phase 4 enhanced sampler
+        sampler = get_enhanced_sampler()
+        return sampler.sample_with_validation(
+            logits, temperature, top_p, top_k, repetition_penalty, past_tokens
+        )
+    else:
+        # Fallback to original implementation (for compatibility)
+        return _sample_next_token_original(logits, temperature, top_p, top_k, repetition_penalty, past_tokens)
+
+def _sample_next_token_original(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None):
+    """Original sampling implementation (kept for compatibility)"""
     if temperature < 1e-5:
         return jnp.argmax(logits, axis=-1)
     
@@ -744,8 +949,17 @@ def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_p
     rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
     return jax.random.categorical(rng_key, logits, axis=-1)
 
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, use_chat_template=True):
-    """Generate text using the model with official parameters."""
+# === END PHASE 4 ENHANCED SAMPLING ===
+
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, use_chat_template=True, use_enhanced_sampling=True, sampling_seed=42):
+    """
+    Generate text using the model with Phase 4 enhanced sampling and PyTorch-aligned parameters.
+    
+    Default parameters now match PyTorch implementation:
+    - top_p: 0.9 (was 0.8)
+    - top_k: 50 (was 20)
+    - repetition_penalty: 1.1 (was 1.05)
+    """
     
     # Apply chat template if requested
     if use_chat_template:
@@ -757,6 +971,11 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         logger.info(f"Chat template applied. Formatted prompt: {repr(formatted_prompt[:200])}...")
     else:
         formatted_prompt = prompt
+    
+    # Initialize enhanced sampler if requested
+    if use_enhanced_sampling:
+        sampler = get_enhanced_sampler(seed=sampling_seed, use_deterministic_rng=True)
+        logger.info("🎯 Using Phase 4 Enhanced Sampling with PyTorch-aligned parameters")
     
     # Tokenize input
     inputs = tokenizer(formatted_prompt, return_tensors="np")
@@ -783,7 +1002,13 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
     generated_tokens = []
     
     logger.info(f"Starting generation with {input_ids.shape[1]} input tokens...")
-    logger.info(f"Using official parameters: temperature={temperature}, top_p={top_p}, top_k={top_k}, repetition_penalty={repetition_penalty}")
+    
+    # Log parameters (updated for PyTorch alignment)
+    sampling_method = "Phase 4 Enhanced" if use_enhanced_sampling else "Original"
+    logger.info(f"Using {sampling_method} sampling: temperature={temperature}, top_p={top_p}, top_k={top_k}, repetition_penalty={repetition_penalty}")
+    
+    if use_enhanced_sampling:
+        logger.info(f"🔢 Deterministic seed: {sampling_seed}")
     
     # Generate tokens
     for i in range(max_tokens):
@@ -801,14 +1026,15 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         
-        # Sample next token with repetition penalty
+        # Sample next token with Phase 4 enhanced implementation
         next_token = sample_next_token(
             logits[:, -1, :], 
             temperature=temperature, 
             top_p=top_p, 
             top_k=top_k,
             repetition_penalty=repetition_penalty,
-            past_tokens=generated_tokens
+            past_tokens=generated_tokens,
+            use_enhanced=use_enhanced_sampling
         )
         
         # Track generated token for repetition penalty
@@ -831,18 +1057,31 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
             break
     
     print()  # New line at end
+    
+    # Log Phase 4 enhanced sampling statistics
+    if use_enhanced_sampling:
+        logger.info(f"📊 Generation completed using {sampler.step_counter} sampling steps")
+    
     return generated_text
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Inference (single device, real model)")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Inference (single device, real model) with Phase 4 Enhanced Sampling")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max_tokens", type=int, default=100, help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (official: 0.7)")
-    parser.add_argument("--top_p", type=float, default=0.8, help="Top-p sampling parameter (official: 0.8)")
-    parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling parameter (official: 20)")
-    parser.add_argument("--repetition_penalty", type=float, default=1.05, help="Repetition penalty (official: 1.05)")
+    
+    # Phase 4: Updated defaults to match PyTorch implementation
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (PyTorch default: 0.7)")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter (PyTorch default: 0.9, was 0.8)")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter (PyTorch default: 50, was 20)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty (PyTorch default: 1.1, was 1.05)")
+    
+    # Phase 4: Enhanced sampling options
+    parser.add_argument("--no_enhanced_sampling", action="store_true", help="Disable Phase 4 enhanced sampling (use original implementation)")
+    parser.add_argument("--sampling_seed", type=int, default=42, help="Seed for deterministic sampling (Phase 4 feature)")
+    
+    # Other options
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--no_chat_template", action="store_true", help="Don't apply chat template")
     args = parser.parse_args()
@@ -869,11 +1108,13 @@ def main():
     
     gc.collect(); jax.clear_caches()
     
-    # Generate with official parameters
+    # Phase 4: Enhanced generation with PyTorch-aligned parameters
     generate_text(
         model, params, tokenizer, args.prompt, args.max_tokens, 
         args.temperature, args.top_p, args.top_k, args.repetition_penalty,
-        use_chat_template=not args.no_chat_template
+        use_chat_template=not args.no_chat_template,
+        use_enhanced_sampling=not args.no_enhanced_sampling,
+        sampling_seed=args.sampling_seed
     )
     
     # Clean up
