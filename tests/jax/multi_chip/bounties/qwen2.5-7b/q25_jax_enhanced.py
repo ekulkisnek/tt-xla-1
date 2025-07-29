@@ -8,32 +8,9 @@ Self-contained, real Qwen2.5-7B-Instruct inference script for single-device JAX.
 - No file output, no simplification, no external local imports
 - Uses Qwen2.5-7B-INSTRUCT weights and applies chat templates
 
-=== PHASE 5 ENHANCED GENERATION LOOP MECHANICS ===
-Building on Phase 3 attention expertise and Phase 4 sampling improvements:
-
-Phase 5A: KV Cache Management Precision (ACHIEVED ✅)
-- 5A.1: Perfect cache tensor alignment (0.00e+00 precision)
-- 5A.2: Optimal memory layout with perfect correctness
-- Cache format [batch, seq, num_kv_heads, head_dim] validated as optimal
-- Multi-step cache accumulation with perfect consistency
-
-Phase 5B: Attention Mask Evolution (ACHIEVED ✅)  
-- 5B.1: Perfect causal masking throughout generation (0.00e+00 precision)
-- 5B.2: Perfect positional encoding alignment with incremental tracking
-- Enhanced RoPE computation with realistic 1e-6 precision threshold
-- Perfect mask-attention interaction validated
-
-Phase 5C: Generation State Management (ACHIEVED ✅)
-- Perfect state transitions during generation
-- Validated position ID incremental tracking
-- Enhanced generation loop with PyTorch alignment
-- Comprehensive state validation at each step
-
-All Phase 5 objectives EXCEEDED with production-ready alignment!
-
 Usage 
-python qwen_jax_inference.py --model_path ../instruct_weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
-python qwen_jax_inference.py --model_path ../instruct_weights --prompt "The capital of France is" --max_tokens 10 --temperature 0.1 --no_enhanced_generation
+python q25_jax_enhanced.py --model_path ../instruct_weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
+python q25_jax_enhanced.py --model_path ../instruct_weights --prompt "The capital of France is" --max_tokens 10 --temperature 0.1
 """
 import os
 import sys
@@ -232,12 +209,11 @@ class QwenAttention(nn.Module):
                 cos, sin = compute_cos_sin_cache(position_ids, self.head_dim, self.rope_theta)
             q, k = apply_rotary_emb(q, k, cos, sin)
         
-        # Handle past key-value cache with Phase 5A validated mechanics
+        # Handle past key-value cache
         if past_key_value is not None:
             past_k, past_v = past_key_value
             
-            # Phase 5A.1: Validated cache format [batch, seq, num_kv_heads, head_dim]
-            # Ensure past cache is in the same format as current k,v
+            # Ensure past cache is in the same format as current k,v: [batch, seq, num_kv_heads, head_dim]
             if past_k.shape[1] == self.num_kv_heads and past_k.shape[2] != self.num_kv_heads:
                 # Past cache is in transposed format [batch, num_kv_heads, seq, head_dim], transpose it back
                 past_k = jnp.transpose(past_k, (0,2,1,3))
@@ -251,14 +227,12 @@ class QwenAttention(nn.Module):
                 past_v = past_v.reshape(batch, -1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
                 past_v = jnp.mean(past_v, axis=3)
             elif past_k.shape[0] == 0 or past_k.shape[1] == 0:  # Empty cache
-                # Phase 5A.1: Perfect empty cache initialization
                 past_k = jnp.zeros((batch, 0, self.num_kv_heads, self.head_dim), dtype=past_k.dtype)
                 past_v = jnp.zeros((batch, 0, self.num_kv_heads, self.head_dim), dtype=past_v.dtype)
             elif past_k.shape[2] != self.num_kv_heads:  # Unexpected head count
                 raise ValueError(f"Past cache has unexpected number of heads: {past_k.shape[2]}, expected {self.num_kv_heads}")
             
-            # Phase 5A.1: Perfect cache concatenation (0.00e+00 precision validated)
-            # Concatenate along sequence dimension - validated to match PyTorch exactly
+            # Concatenate along sequence dimension
             k = jnp.concatenate([past_k, k], axis=1)
             v = jnp.concatenate([past_v, v], axis=1)
         
@@ -277,8 +251,8 @@ class QwenAttention(nn.Module):
         k = jnp.transpose(k, (0,2,1,3))  # [batch, num_heads, seq, head_dim]
         v = jnp.transpose(v, (0,2,1,3))  # [batch, num_heads, seq, head_dim]
         
-        # Attention with exact PyTorch precision matching
-        scale = float(1.0 / np.sqrt(self.head_dim))  # Use NumPy for exact precision match
+        # Attention
+        scale = 1.0 / np.sqrt(self.head_dim)
         attn_scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
@@ -290,31 +264,20 @@ class QwenAttention(nn.Module):
         return self.o_proj(attn_out), (cache_k, cache_v)
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=10000.0):
-    """
-    Compute RoPE cos/sin cache with Phase 5B.2 validated precision.
-    
-    Phase 5B.2 findings:
-    - Perfect position ID creation alignment (0 difference)
-    - Excellent RoPE computation precision (~5.96e-08)
-    - Realistic precision threshold: 1e-6 for trigonometric operations
-    """
     # position_ids: [batch, seq]
     # Returns cos, sin: [batch, seq, head_dim]
-    pos = jnp.array(position_ids)
+    pos = np.array(position_ids)
     if pos.ndim == 1:
         pos = pos[None, :]
-    
-    # Phase 5B.2: Validated RoPE computation with enhanced precision
     dim = head_dim // 2
-    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
-    freqs = jnp.einsum('bi,j->bij', pos, inv_freq)
+    inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, dtype=np.float32) / dim))
+    freqs = np.einsum('bi,j->bij', pos, inv_freq)
     
-    # Phase 5B.2: Enhanced trigonometric computation
-    # Use JAX operations for consistency
-    cos = jnp.cos(freqs)
-    sin = jnp.sin(freqs)
+    # Create cos and sin for full head_dim (not head_dim//2)
+    cos = jnp.array(np.cos(freqs))
+    sin = jnp.array(np.sin(freqs))
     
-    # Phase 5B.2: Validated repeat operation for head_dim alignment
+    # Repeat to match head_dim
     cos = jnp.repeat(cos, 2, axis=-1)
     sin = jnp.repeat(sin, 2, axis=-1)
     
@@ -363,9 +326,9 @@ class QwenDecoderLayer(nn.Module):
     def setup(self):
         c = self.config
         self.hidden_size = c["hidden_size"]
-        self.input_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-6)), dtype=self.dtype, name="input_layernorm")
+        self.input_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-5)), dtype=self.dtype, name="input_layernorm")
         self.self_attn = QwenAttention(config=c, dtype=self.dtype)
-        self.post_attention_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-6)), dtype=self.dtype, name="post_attention_layernorm")
+        self.post_attention_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-5)), dtype=self.dtype, name="post_attention_layernorm")
         self.mlp = QwenMLP(config=c, dtype=self.dtype)
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
@@ -405,7 +368,7 @@ class Qwen25ForCausalLM(nn.Module):
         self.num_layers = c["num_hidden_layers"]
         self.embed_tokens = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size, dtype=self.dtype, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=self.dtype, name=f"layers_{i}") for i in range(self.num_layers)]
-        self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-6)), dtype=self.dtype, name="norm")
+        self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", c.get("layer_norm_epsilon", 1e-5)), dtype=self.dtype, name="norm")
         self.lm_head = nn.Dense(self.vocab_size, dtype=self.dtype, use_bias=False, name="lm_head")
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
@@ -421,15 +384,13 @@ class Qwen25ForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = jnp.ones((batch, 1, 1, seq), dtype=self.dtype)
         
-        # Phase 5B.1: Perfect causal mask evolution (0.00e+00 precision validated)
-        # Create proper causal mask for variable lengths using validated implementation
+        # Create proper causal mask for variable lengths
         causal_mask = make_causal_mask(seq, key_len)
         causal_mask = causal_mask[None, None, :, :]  # Add batch and head dims
         
         # Convert attention_mask to bias: 0 -> -1e9, 1 -> 0
         attention_bias = (1.0 - attention_mask) * -1e9
         
-        # Phase 5B.1: Perfect incremental mask evolution during generation
         # For generation, we need to extend attention bias to match key length
         if key_len > seq:
             # Pad attention bias to match key length
@@ -437,7 +398,7 @@ class Qwen25ForCausalLM(nn.Module):
             pad_bias = jnp.zeros((batch, 1, 1, pad_len), dtype=self.dtype)
             attention_bias = jnp.concatenate([pad_bias, attention_bias], axis=-1)
         
-        # Phase 5B.1: Combine attention bias and causal mask with validated precision
+        # Combine attention bias and causal mask
         attention_bias = attention_bias + causal_mask
         
         hidden_states = self.embed_tokens(input_ids)
@@ -465,7 +426,7 @@ class Qwen25ForCausalLM(nn.Module):
                 "logits": logits,
                 "past_key_values": new_key_values
             }
-        return logits
+        return logits 
 
 # --- Weight loading (real mapping from run_inference.py/model.py) ---
 def get_param_path(name):
@@ -726,214 +687,9 @@ def apply_chat_template(tokenizer, messages):
         formatted += "<|im_start|>assistant\n"
         return formatted
 
-# === PHASE 4 ENHANCED SAMPLING ===
-# Incorporating Phase 4 findings: deterministic RNG, realistic precision thresholds, 
-# optimized top-k/top-p implementations, and PyTorch parameter alignment
-
-class Phase4EnhancedSampler:
-    """Phase 4 enhanced sampler with validated precision and PyTorch alignment"""
-    
-    def __init__(self, seed=42, use_deterministic_rng=True):
-        self.seed = seed
-        self.use_deterministic_rng = use_deterministic_rng
-        self.step_counter = 0
-        
-        # Phase 4 validated precision thresholds
-        self.SOFTMAX_THRESHOLD = 1e-5
-        self.CUMSUM_THRESHOLD = 1e-6
-        self.COMPARISON_THRESHOLD = 1e-6
-        
-        # Initialize RNG state for deterministic sampling (Phase 4A.1)
-        if use_deterministic_rng:
-            self.rng_key = jax.random.PRNGKey(seed)
-        
-        logger.info(f"🎯 Phase 4 Enhanced Sampler initialized (seed={seed}, deterministic={use_deterministic_rng})")
-    
-    def get_next_rng_key(self):
-        """Get next RNG key with deterministic progression (Phase 4A.1 finding)"""
-        if self.use_deterministic_rng:
-            self.rng_key, subkey = jax.random.split(self.rng_key)
-            return subkey
-        else:
-            # Fallback to time-based (less ideal but maintains compatibility)
-            return jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
-    
-    def apply_temperature_scaling(self, logits, temperature):
-        """Apply temperature scaling with Phase 4A.2 validated precision"""
-        if temperature < 1e-5:
-            # Phase 4C.1: Perfect argmax consistency for low temperature
-            return logits, True  # Return flag indicating greedy sampling
-        
-        # Phase 4A.2: Basic temperature scaling achieves 0.00e+00 precision
-        scaled_logits = logits / temperature
-        return scaled_logits, False
-    
-    def apply_topk_filtering(self, logits, k):
-        """Apply top-k filtering with Phase 4B.1 validated implementation"""
-        if k <= 0:
-            return logits
-        
-        batch_size = logits.shape[0] if logits.ndim > 1 else 1
-        vocab_size = logits.shape[-1]
-        
-        if k >= vocab_size:
-            return logits  # No filtering needed
-        
-        # Phase 4B.1: Use validated jax.lax.top_k implementation
-        top_k_values, top_k_indices = jax.lax.top_k(logits, k=k)
-        
-        # Phase 4B.1: Vectorized mask creation (more efficient than loops)
-        if logits.ndim == 1:
-            mask = jnp.full_like(logits, False, dtype=bool)
-            mask = mask.at[top_k_indices].set(True)
-        else:
-            mask = jnp.full_like(logits, False, dtype=bool)
-            batch_indices = jnp.arange(batch_size)[:, None]
-            mask = mask.at[batch_indices, top_k_indices].set(True)
-        
-        # Set non-top-k logits to -inf
-        filtered_logits = jnp.where(mask, logits, -jnp.inf)
-        return filtered_logits
-    
-    def apply_topp_filtering(self, logits, p):
-        """Apply top-p filtering with Phase 4B.2 validated implementation"""
-        if p >= 1.0:
-            return logits
-        
-        # Phase 4B.2: Use validated sorting and cumsum approach
-        sorted_indices = jnp.argsort(logits, axis=-1)[..., ::-1]
-        sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
-        
-        # Apply softmax with Phase 4A.2 validated precision
-        sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
-        
-        # Phase 4B.2: Cumulative probability computation
-        cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
-        
-        # Find indices to remove (with Phase 4B.2 threshold handling)
-        sorted_indices_to_remove = cumulative_probs > p
-        # Keep at least the first token (Phase 4B.2 edge case handling)
-        sorted_indices_to_remove = sorted_indices_to_remove.at[..., 0].set(False)
-        
-        # Map back to original indices
-        if logits.ndim == 1:
-            indices_to_remove = jnp.zeros_like(logits, dtype=bool)
-            indices_to_remove = indices_to_remove.at[sorted_indices].set(sorted_indices_to_remove)
-        else:
-            indices_to_remove = jnp.zeros_like(logits, dtype=bool)
-            batch_indices = jnp.arange(logits.shape[0])[:, None]
-            indices_to_remove = indices_to_remove.at[batch_indices, sorted_indices].set(sorted_indices_to_remove)
-        
-        filtered_logits = jnp.where(indices_to_remove, -jnp.inf, logits)
-        return filtered_logits
-    
-    def apply_repetition_penalty(self, logits, past_tokens, penalty):
-        """Apply repetition penalty with validation"""
-        if penalty == 1.0 or past_tokens is None or len(past_tokens) == 0:
-            return logits
-        
-        # Apply penalty to recently generated tokens
-        for token_id in past_tokens[-50:]:  # Consider last 50 tokens
-            if 0 <= token_id < logits.shape[-1]:
-                logits = logits.at[..., token_id].multiply(1.0 / penalty)
-        
-        return logits
-    
-    def sample_with_validation(self, logits, temperature=0.7, top_p=0.9, top_k=50, 
-                              repetition_penalty=1.1, past_tokens=None, validate=False):
-        """
-        Enhanced sampling with Phase 4 validated implementations and PyTorch alignment
-        
-        Default parameters now match PyTorch implementation:
-        - temperature=0.7 (same)
-        - top_p=0.9 (was 0.8, now matches PyTorch)  
-        - top_k=50 (was 20, now matches PyTorch)
-        - repetition_penalty=1.1 (was 1.05, now matches PyTorch)
-        """
-        original_logits = logits.copy() if validate else None
-        
-        # Step 1: Apply repetition penalty
-        logits = self.apply_repetition_penalty(logits, past_tokens, repetition_penalty)
-        
-        # Step 2: Apply temperature scaling (Phase 4A.2 validated)
-        logits, is_greedy = self.apply_temperature_scaling(logits, temperature)
-        
-        if is_greedy:
-            # Phase 4C.1: Perfect argmax consistency for greedy sampling
-            return jnp.argmax(logits, axis=-1)
-        
-        # Step 3: Apply top-k filtering (Phase 4B.1 validated)
-        logits = self.apply_topk_filtering(logits, top_k)
-        
-        # Step 4: Apply top-p filtering (Phase 4B.2 validated)
-        logits = self.apply_topp_filtering(logits, top_p)
-        
-        # Step 5: Sample using deterministic RNG (Phase 4A.1 validated)
-        rng_key = self.get_next_rng_key()
-        sampled_token = jax.random.categorical(rng_key, logits, axis=-1)
-        
-        # Optional validation using Phase 4 methodology
-        if validate:
-            self._validate_sampling_step(original_logits, logits, sampled_token, temperature, top_p, top_k)
-        
-        self.step_counter += 1
-        return sampled_token
-    
-    def _validate_sampling_step(self, original_logits, final_logits, sampled_token, temperature, top_p, top_k):
-        """Validate sampling step using Phase 4 methodology"""
-        # Check for numerical stability
-        if jnp.any(jnp.isnan(final_logits)) or jnp.any(jnp.isinf(final_logits)):
-            # Count finite values
-            finite_count = jnp.sum(jnp.isfinite(final_logits))
-            if finite_count == 0:
-                logger.warning(f"⚠️ All logits are non-finite after filtering (step {self.step_counter})")
-            else:
-                logger.debug(f"✓ {finite_count} finite logits remaining after filtering")
-        
-        # Validate sampled token is in valid range
-        vocab_size = original_logits.shape[-1]
-        if not (0 <= sampled_token < vocab_size):
-            logger.error(f"❌ Invalid sampled token: {sampled_token} (vocab_size={vocab_size})")
-        
-        # Check probability conservation (Phase 4B.2 finding)
-        if temperature > 1e-5:  # Only for non-greedy sampling
-            probs = jax.nn.softmax(final_logits, axis=-1)
-            prob_sum = jnp.sum(probs)
-            if abs(float(prob_sum) - 1.0) > self.SOFTMAX_THRESHOLD:
-                logger.warning(f"⚠️ Probability sum deviation: {float(prob_sum):.6f}")
-
-# Create global enhanced sampler instance
-_enhanced_sampler = None
-
-def get_enhanced_sampler(seed=42, use_deterministic_rng=True):
-    """Get or create the enhanced sampler instance"""
-    global _enhanced_sampler
-    if _enhanced_sampler is None:
-        _enhanced_sampler = Phase4EnhancedSampler(seed=seed, use_deterministic_rng=use_deterministic_rng)
-    return _enhanced_sampler
-
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, past_tokens=None, use_enhanced=True):
-    """
-    Sample from logits with Phase 4 enhanced implementation and PyTorch-aligned parameters.
-    
-    Parameters now match PyTorch defaults:
-    - top_p: 0.9 (was 0.8)
-    - top_k: 50 (was 20) 
-    - repetition_penalty: 1.1 (was 1.05)
-    """
-    if use_enhanced:
-        # Use Phase 4 enhanced sampler
-        sampler = get_enhanced_sampler()
-        return sampler.sample_with_validation(
-            logits, temperature, top_p, top_k, repetition_penalty, past_tokens
-        )
-    else:
-        # Fallback to original implementation (for compatibility)
-        return _sample_next_token_original(logits, temperature, top_p, top_k, repetition_penalty, past_tokens)
-
-def _sample_next_token_original(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None):
-    """Original sampling implementation (kept for compatibility)"""
+def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None):
+    """Sample from logits with official Qwen2.5-7B-Instruct parameters."""
     if temperature < 1e-5:
         return jnp.argmax(logits, axis=-1)
     
@@ -988,215 +744,8 @@ def _sample_next_token_original(logits, temperature=0.7, top_p=0.8, top_k=20, re
     rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
     return jax.random.categorical(rng_key, logits, axis=-1)
 
-# === END PHASE 4 ENHANCED SAMPLING ===
-
-# === PHASE 5 ENHANCED GENERATION LOOP ===
-# Incorporating Phase 5 findings: perfect cache handling, mask evolution, 
-# position management, and PyTorch generation loop alignment
-
-class Phase5EnhancedGenerator:
-    """Phase 5 enhanced generator with validated generation loop mechanics"""
-    
-    def __init__(self, model, params, tokenizer, config):
-        self.model = model
-        self.params = params
-        self.tokenizer = tokenizer
-        self.config = config
-        
-        # Phase 5 validated precision thresholds
-        self.CACHE_PRECISION_THRESHOLD = 0.0  # Phase 5A.1: Perfect cache alignment
-        self.MASK_PRECISION_THRESHOLD = 0.0   # Phase 5B.1: Perfect mask alignment  
-        self.POSITION_PRECISION_THRESHOLD = 0  # Phase 5B.2: Perfect position alignment
-        self.ROPE_PRECISION_THRESHOLD = 1e-6  # Phase 5B.2: Realistic RoPE precision
-        
-        logger.info("🎯 Phase 5 Enhanced Generator initialized with validated generation loop mechanics")
-    
-    def validate_cache_update(self, past_cache, current_cache, updated_cache, step):
-        """Validate cache update using Phase 5A.1 methodology"""
-        if past_cache is None:
-            return True  # Empty cache case validated in Phase 5A.1
-        
-        past_k, past_v = past_cache
-        current_k, current_v = current_cache  
-        updated_k, updated_v = updated_cache
-        
-        # Phase 5A.1: Validate cache concatenation precision
-        expected_seq_len = past_k.shape[1] + current_k.shape[1]
-        if updated_k.shape[1] != expected_seq_len or updated_v.shape[1] != expected_seq_len:
-            logger.warning(f"⚠️ Cache sequence length mismatch at step {step}")
-            return False
-        
-        # Phase 5A.1: Validate cache format [batch, seq, num_kv_heads, head_dim]
-        expected_format = past_k.shape[0:1] + (expected_seq_len,) + past_k.shape[2:]
-        if updated_k.shape != expected_format or updated_v.shape != expected_format:
-            logger.warning(f"⚠️ Cache format validation failed at step {step}")
-            return False
-        
-        return True
-    
-    def create_incremental_position_ids(self, batch_size, current_offset):
-        """Create position IDs using Phase 5B.2 validated approach"""
-        # Phase 5B.2: Perfect incremental position tracking
-        position_ids = jnp.arange(current_offset, current_offset + 1, dtype=jnp.int32)[None, :]
-        position_ids = jnp.broadcast_to(position_ids, (batch_size, 1))
-        return position_ids
-    
-    def create_incremental_causal_mask(self, q_len, k_len):
-        """Create causal mask using Phase 5B.1 validated implementation"""
-        # Phase 5B.1: Perfect causal mask evolution
-        i = jnp.arange(q_len)[:, None]
-        j = jnp.arange(k_len)[None, :]
-        mask = (i < j - (k_len - q_len)) * -1e9
-        return mask
-    
-    def validate_generation_state(self, state, step, expected_seq_len):
-        """Validate generation state using Phase 5 methodology"""
-        
-        if step == 0:
-            # Step 0: We have the full input sequence
-            if state["input_ids"].shape[1] < 1:
-                logger.warning(f"⚠️ Input IDs should have at least one token at step {step}")
-                return False
-            
-            # Position IDs should cover the full input sequence at step 0
-            if state["position_ids"].shape[1] != state["input_ids"].shape[1]:
-                logger.warning(f"⚠️ Position IDs length mismatch at step {step}")
-                return False
-                
-            # Attention mask should cover the full input sequence at step 0
-            if state["attention_mask"].shape[-1] != state["input_ids"].shape[1]:
-                logger.warning(f"⚠️ Attention mask length mismatch at step {step}")
-                return False
-        else:
-            # Step 1+: We have incremental single tokens
-            if state["input_ids"].shape[1] != 1:
-                logger.warning(f"⚠️ Input IDs should be single token at step {step}")
-                return False
-            
-            # Validate position_ids incremental tracking for step 1+
-            # At step N, we should be generating token at position (initial_seq_len + N - 1)
-            expected_position = expected_seq_len - 1  # This is the position we're generating at
-            if state["position_ids"][0, 0] != expected_position:
-                logger.warning(f"⚠️ Position tracking mismatch at step {step}: expected {expected_position}, got {state['position_ids'][0, 0]}")
-                return False
-            
-            # Validate attention_mask shape for incremental generation
-            if state["attention_mask"].shape[-1] != 1:
-                logger.warning(f"⚠️ Attention mask should be for single token at step {step}")
-                return False
-        
-        return True
-    
-    def enhanced_generate_step(self, state, step, initial_seq_len, use_enhanced_sampling, sampler, 
-                              temperature, top_p, top_k, repetition_penalty, generated_tokens):
-        """Enhanced generation step with Phase 5 validated mechanics"""
-        
-        # Phase 5: Validate current state
-        current_seq_len = initial_seq_len + step
-        if not self.validate_generation_state(state, step, current_seq_len):
-            logger.warning(f"⚠️ State validation failed at step {step}")
-        
-        # Forward pass with current state
-        outputs = self.model.apply(
-            self.params,
-            input_ids=state["input_ids"],
-            attention_mask=state["attention_mask"],
-            position_ids=state["position_ids"],
-            past_key_values=state["past_key_values"],
-            return_dict=True
-        )
-        
-        # Extract outputs
-        logits = outputs["logits"]
-        new_past_key_values = outputs["past_key_values"]
-        
-        # Phase 5A: Validate cache update if we have past cache
-        if state["past_key_values"] is not None and new_past_key_values is not None:
-            # Validate first layer cache as representative
-            if len(state["past_key_values"]) > 0 and len(new_past_key_values) > 0:
-                past_cache = state["past_key_values"][0] if state["past_key_values"][0] is not None else None
-                new_cache = new_past_key_values[0] if new_past_key_values[0] is not None else None
-                
-                if past_cache is not None and new_cache is not None:
-                    # Mock current cache for validation (we can't directly access it from model)
-                    past_k, past_v = past_cache
-                    new_k, new_v = new_cache
-                    current_k = new_k[:, -1:, :, :]  # Last token's K,V
-                    current_v = new_v[:, -1:, :, :]
-                    
-                    self.validate_cache_update(past_cache, (current_k, current_v), new_cache, step)
-        
-        # Phase 4 + 5: Enhanced sampling with validation
-        if use_enhanced_sampling:
-            next_token = sampler.sample_with_validation(
-                logits[:, -1, :], 
-                temperature=temperature, 
-                top_p=top_p, 
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                past_tokens=generated_tokens
-            )
-        else:
-            next_token = sample_next_token(
-                logits[:, -1, :], 
-                temperature=temperature, 
-                top_p=top_p, 
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                past_tokens=generated_tokens,
-                use_enhanced=False
-            )
-        
-        return next_token, new_past_key_values
-    
-    def update_generation_state(self, state, next_token, step, initial_seq_len):
-        """Update generation state using Phase 5B.2 validated position management"""
-        
-        batch_size = state["input_ids"].shape[0]
-        
-        # Phase 5B.2: Perfect incremental position tracking
-        # The token we just generated is at position (initial_seq_len + step)
-        # For the next generation step, we process this token at that position
-        current_position = initial_seq_len + step
-        new_position_ids = self.create_incremental_position_ids(batch_size, current_position)
-        
-        # Update state with Phase 5 validated approach
-        # For subsequent steps, we only need the next token as input
-        updated_state = {
-            "input_ids": next_token[:, None],
-            "attention_mask": jnp.ones((batch_size, 1, 1, 1), dtype=jnp.int32),
-            "position_ids": new_position_ids,
-            "past_key_values": None  # Will be set by caller
-        }
-        
-        return updated_state
-
-# Global enhanced generator instance
-_enhanced_generator = None
-
-def get_enhanced_generator(model, params, tokenizer, config):
-    """Get or create the enhanced generator instance"""
-    global _enhanced_generator
-    if _enhanced_generator is None:
-        _enhanced_generator = Phase5EnhancedGenerator(model, params, tokenizer, config)
-    return _enhanced_generator
-
-# === END PHASE 5 ENHANCED GENERATION LOOP ===
-
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, use_chat_template=True, use_enhanced_sampling=True, use_enhanced_generation=True, sampling_seed=42):
-    """
-    Generate text using the model with Phase 4 enhanced sampling and Phase 5 enhanced generation loop.
-    
-    Default parameters now match PyTorch implementation:
-    - top_p: 0.9 (was 0.8)
-    - top_k: 50 (was 20)
-    - repetition_penalty: 1.1 (was 1.05)
-    
-    Phase 5 enhancements:
-    - Perfect cache handling with validation
-    - Perfect causal mask evolution
-    - Perfect position ID management
-    """
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, use_chat_template=True):
+    """Generate text using the model with official parameters."""
     
     # Apply chat template if requested
     if use_chat_template:
@@ -1209,23 +758,14 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
     else:
         formatted_prompt = prompt
     
-    # Initialize enhanced sampler if requested
-    if use_enhanced_sampling:
-        sampler = get_enhanced_sampler(seed=sampling_seed, use_deterministic_rng=True)
-        logger.info("🎯 Using Phase 4 Enhanced Sampling with PyTorch-aligned parameters")
-    
     # Tokenize input
     inputs = tokenizer(formatted_prompt, return_tensors="np")
     input_ids = inputs["input_ids"]
     
-    # Create proper causal attention mask for autoregressive generation
+    # Create attention mask - use 4D format for Qwen model
     batch_size = input_ids.shape[0]
     seq_length = input_ids.shape[1]
-    
-    # Create causal mask: 0 for valid positions, large negative for masked positions
-    causal_mask = np.tril(np.ones((seq_length, seq_length)))  # Lower triangular
-    causal_mask = np.where(causal_mask == 0, -1e9, 0.0)  # 0 for valid, -1e9 for masked
-    attention_mask = causal_mask[None, None, :, :]  # Add batch and head dimensions
+    attention_mask = np.ones((batch_size, 1, 1, seq_length), dtype=np.int32)
     
     # Position IDs - make sure to match the input_ids length
     position_ids = np.arange(input_ids.shape[1], dtype=np.int32)[None, :]
@@ -1243,73 +783,42 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
     generated_tokens = []
     
     logger.info(f"Starting generation with {input_ids.shape[1]} input tokens...")
-    
-    # Log parameters (updated for PyTorch alignment)
-    sampling_method = "Phase 4 Enhanced" if use_enhanced_sampling else "Original"
-    generation_method = "Phase 5 Enhanced" if use_enhanced_generation else "Standard"
-    logger.info(f"Using {sampling_method} sampling + {generation_method} generation: temperature={temperature}, top_p={top_p}, top_k={top_k}, repetition_penalty={repetition_penalty}")
-    
-    if use_enhanced_sampling:
-        logger.info(f"🔢 Deterministic seed: {sampling_seed}")
-    
-    # Initialize Phase 5 enhanced generator if requested
-    if use_enhanced_generation:
-        # Load config for enhanced generator
-        config_path = os.path.join(os.path.dirname(__file__), "config.json") if hasattr(model, 'config') else None
-        config = getattr(model, 'config', {}) if hasattr(model, 'config') else {}
-        
-        enhanced_generator = get_enhanced_generator(model, params, tokenizer, config)
-        logger.info("🎯 Using Phase 5 Enhanced Generation Loop with validated mechanics")
+    logger.info(f"Using official parameters: temperature={temperature}, top_p={top_p}, top_k={top_k}, repetition_penalty={repetition_penalty}")
     
     # Generate tokens
     for i in range(max_tokens):
-        if use_enhanced_generation:
-            # Phase 5: Enhanced generation step with validated mechanics
-            next_token, past_key_values = enhanced_generator.enhanced_generate_step(
-                state, i, seq_length, use_enhanced_sampling, sampler,
-                temperature, top_p, top_k, repetition_penalty, generated_tokens
-            )
-        else:
-            # Standard generation step (Phase 4 only)
-            outputs = model.apply(
-                params,
-                input_ids=state["input_ids"],
-                attention_mask=state["attention_mask"],
-                position_ids=state["position_ids"],
-                past_key_values=state["past_key_values"],
-                return_dict=True
-            )
-            
-            # Get logits and past key values
-            logits = outputs["logits"]
-            past_key_values = outputs["past_key_values"]
-            
-            # Sample next token with Phase 4 enhanced implementation
-            next_token = sample_next_token(
-                logits[:, -1, :], 
-                temperature=temperature, 
-                top_p=top_p, 
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-                past_tokens=generated_tokens,
-                use_enhanced=use_enhanced_sampling
-            )
+        # Forward pass
+        outputs = model.apply(
+            params,
+            input_ids=state["input_ids"],
+            attention_mask=state["attention_mask"],
+            position_ids=state["position_ids"],
+            past_key_values=state["past_key_values"],
+            return_dict=True
+        )
+        
+        # Get logits and past key values
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
+        
+        # Sample next token with repetition penalty
+        next_token = sample_next_token(
+            logits[:, -1, :], 
+            temperature=temperature, 
+            top_p=top_p, 
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            past_tokens=generated_tokens
+        )
         
         # Track generated token for repetition penalty
         generated_tokens.append(int(next_token[0]))
         
         # Update state
-        if use_enhanced_generation:
-            # Phase 5: Enhanced state update with validated position management
-            state = enhanced_generator.update_generation_state(state, next_token, i, seq_length)
-            state["past_key_values"] = past_key_values
-        else:
-            # Standard state update
-            state["input_ids"] = next_token[:, None]
-            # For incremental generation, attention mask should be zeros (no masking needed with KV cache)
-            state["attention_mask"] = np.zeros((batch_size, 1, 1, 1), dtype=np.float32)
-            state["position_ids"] = np.array([[state["position_ids"][0, -1] + 1]], dtype=np.int32)
-            state["past_key_values"] = past_key_values
+        state["input_ids"] = next_token[:, None]
+        state["attention_mask"] = np.ones((batch_size, 1, 1, 1), dtype=np.int32)
+        state["position_ids"] = np.array([[state["position_ids"][0, -1] + 1]], dtype=np.int32)
+        state["past_key_values"] = past_key_values
         
         # Decode and print token
         token = tokenizer.decode(next_token[0])
@@ -1322,37 +831,18 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
             break
     
     print()  # New line at end
-    
-    # Log Phase 4 + 5 enhanced statistics
-    if use_enhanced_sampling:
-        logger.info(f"📊 Generation completed using {sampler.step_counter} sampling steps")
-    
-    if use_enhanced_generation:
-        logger.info("🎯 Phase 5 Enhanced Generation Loop completed successfully")
-    
     return generated_text
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Inference (single device, real model) with Phase 4 Enhanced Sampling + Phase 5 Enhanced Generation")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Inference (single device, real model)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max_tokens", type=int, default=100, help="Maximum tokens to generate")
-    
-    # Phase 4: Updated defaults to match PyTorch implementation
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (PyTorch default: 0.7)")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter (PyTorch default: 0.9, was 0.8)")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter (PyTorch default: 50, was 20)")
-    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="Repetition penalty (PyTorch default: 1.1, was 1.05)")
-    
-    # Phase 4: Enhanced sampling options
-    parser.add_argument("--no_enhanced_sampling", action="store_true", help="Disable Phase 4 enhanced sampling (use original implementation)")
-    parser.add_argument("--sampling_seed", type=int, default=42, help="Seed for deterministic sampling (Phase 4 feature)")
-    
-    # Phase 5: Enhanced generation loop options
-    parser.add_argument("--no_enhanced_generation", action="store_true", help="Disable Phase 5 enhanced generation loop (use standard implementation)")
-    
-    # Other options
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (official: 0.7)")
+    parser.add_argument("--top_p", type=float, default=0.8, help="Top-p sampling parameter (official: 0.8)")
+    parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling parameter (official: 20)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.05, help="Repetition penalty (official: 1.05)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--no_chat_template", action="store_true", help="Don't apply chat template")
     args = parser.parse_args()
@@ -1379,14 +869,11 @@ def main():
     
     gc.collect(); jax.clear_caches()
     
-    # Phase 4 + 5: Enhanced generation with PyTorch-aligned parameters and validated generation loop
+    # Generate with official parameters
     generate_text(
         model, params, tokenizer, args.prompt, args.max_tokens, 
         args.temperature, args.top_p, args.top_k, args.repetition_penalty,
-        use_chat_template=not args.no_chat_template,
-        use_enhanced_sampling=not args.no_enhanced_sampling,
-        use_enhanced_generation=not args.no_enhanced_generation,
-        sampling_seed=args.sampling_seed
+        use_chat_template=not args.no_chat_template
     )
     
     # Clean up
