@@ -103,9 +103,6 @@ def generate_response(model, tokenizer, question, max_new_tokens=256):
     
     start_time = time.time()
     
-    # Set fixed RNG seed for reproducibility
-    torch.manual_seed(42)
-    
     # Generate with memory optimization
     with torch.no_grad():
         # Use smaller batch size and shorter sequences for memory efficiency
@@ -146,7 +143,7 @@ def main():
     """Main inference function"""
     
     print("="*80)
-    print("QWEN2.5-7B MODEL INFERENCE - DOG FOOD TEST")
+    print("QWEN2.5-7B MODEL INFERENCE - GSM8K MATH QUESTIONS")
     print("Using Local Weights")
     print("="*80)
     
@@ -159,24 +156,41 @@ def main():
     
     print(f"\nUsing model: {model_name}")
     
-    # Dog food question only
-    question = "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?"
-    
-    print(f"\n" + "="*60)
-    print(f"DOG FOOD QUESTION:")
-    print(question)
-    print("\n" + "="*60)
-    print("RESPONSE:")
-    
-    try:
-        response = generate_response(model, tokenizer, question, max_new_tokens=256)
-        print(response)
+    # GSM8K-style math questions
+    math_questions = [
+        "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?",
         
-    except Exception as e:
-        print(f"Error during generation: {e}")
-        print("This might be due to insufficient memory for the 7B model.")
+        "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+        
+        "Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?",
+        
+        "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
+        
+        "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+        
+        "If a train travels 60 miles per hour, how far will it travel in 2.5 hours?",
+        
+        "A store sells shirts for $25 each and pants for $40 each. If someone buys 3 shirts and 2 pairs of pants, how much do they spend in total?",
+        
+        "A recipe calls for 2 cups of flour to make 12 cookies. How many cups of flour are needed to make 36 cookies?"
+    ]
     
-    print(f"\n" + "-"*60)
+    for i, question in enumerate(math_questions, 1):
+        print(f"\n" + "="*60)
+        print(f"MATH QUESTION {i}:")
+        print(question)
+        print("\n" + "="*60)
+        print("RESPONSE:")
+        
+        try:
+            response = generate_response(model, tokenizer, question, max_new_tokens=256)
+            print(response)
+            
+        except Exception as e:
+            print(f"Error during generation: {e}")
+            print("This might be due to insufficient memory for the 7B model.")
+        
+        print(f"\n" + "-"*60)
     
     # Clean up
     del model, tokenizer
@@ -185,7 +199,7 @@ def main():
     print(f"\nFinal memory state:")
     check_memory()
     
-    print("\nDog food test completed!")
+    print("\nMath inference completed!")
 
 if __name__ == "__main__":
-    main()
+    main() 

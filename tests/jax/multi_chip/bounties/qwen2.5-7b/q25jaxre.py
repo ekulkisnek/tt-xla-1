@@ -8,7 +8,7 @@ Self-contained Qwen2.5-7B-Instruct inference script for single-device JAX.
 - Matches PyTorch script behavior.
 
 Usage:
-python q25_jax_final.py --model_path weights --prompt "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?" --max_tokens 256 --temperature 0.7 --top_p 0.9 --top_k 50
+python q25_jax_final.py --model_path weights --prompt "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?" --max_tokens 256 --temperature 0.1 --top_p 0.9 --top_k 50 --dtype bfloat16
 """
 import os
 import sys
@@ -232,7 +232,7 @@ def load_params(model, model_path, dtype):
     return params
 
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, past_tokens=None):
+def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None, seed=0):
     logits = jnp.clip(logits, -20, 20)  # Prevent numerical issues
     
     # Apply repetition penalty
@@ -262,9 +262,9 @@ def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50, repetition_p
         mask = mask.at[..., 0].set(True)  # Keep at least one token
         logits = jnp.where(jnp.take_along_axis(mask, jnp.argsort(sorted_indices, axis=-1), axis=-1), logits, -jnp.inf)
     
-    return jax.random.categorical(jax.random.PRNGKey(42), logits, axis=-1)  # Fixed global seed
+    return jax.random.categorical(jax.random.PRNGKey(seed), logits, axis=-1)
 
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1):
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05):
     messages = [
         {"role": "system", "content": "You are a highly capable math assistant. Solve the problem step-by-step and provide a clear, concise answer."},
         {"role": "user", "content": prompt}
@@ -281,7 +281,7 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         outputs = model.apply(params, input_ids=input_ids, position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
-        next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k, repetition_penalty, generated_tokens)
+        next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k, repetition_penalty, generated_tokens, seed=i)
         generated_tokens.append(int(next_token[0]))
         input_ids = next_token[:, None]
         position_ids = position_ids[:, -1:] + 1
@@ -299,7 +299,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
@@ -319,4 +319,4 @@ def main():
     jax.clear_caches()
 
 if __name__ == "__main__":
-    main()
+    main() 

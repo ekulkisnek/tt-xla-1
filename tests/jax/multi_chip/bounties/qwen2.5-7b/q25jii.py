@@ -303,10 +303,10 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--dtype", type=str, default="float16", choices=["float32", "float16"])
     args = parser.parse_args()
 
-    dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
+    dtype = jnp.float16  # Align with PyTorch
     with open(os.path.join(args.model_path, "config.json")) as f:
         config = json.load(f)
     model = Qwen25ForCausalLM(config=config, dtype=dtype)
