@@ -8,7 +8,7 @@ Self-contained Qwen2.5-7B-Instruct inference script for single-device JAX.
 - Matches PyTorch script behavior.
 
 Usage:
-python q25jaxre3.py --model_path weights --prompt "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?" --max_tokens 256 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16 --compare_sampling
+python q25jaxre2.py --model_path weights --prompt "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?" --max_tokens 256 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
 """
 import os
 import sys
@@ -22,10 +22,10 @@ from typing import Dict, Any, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from flax import linen as nn
 from safetensors import safe_open
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+from transformers import AutoTokenizer
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -263,196 +263,12 @@ def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_p
         mask = mask.at[..., 0].set(True)  # Keep at least one token
         logits = jnp.where(jnp.take_along_axis(mask, jnp.argsort(sorted_indices, axis=-1), axis=-1), logits, -jnp.inf)
     
-    return jax.random.categorical(jax.random.PRNGKey(seed), logits, axis=-1)
-
-def load_pytorch_model(model_path):
-    """Load PyTorch model for comparison"""
-    print("Loading PyTorch model for comparison...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
-    return model, tokenizer
-
-def compare_first_token_sampling(jax_model, jax_params, jax_tokenizer, pytorch_model, pytorch_tokenizer, 
-                                test_prompt="Janet's dogs eat", temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1):
-    """Compare first token sampling between JAX and PyTorch models"""
-    print(f"\n=== COMPARING FIRST TOKEN SAMPLING ===")
-    print(f"Test prompt: '{test_prompt}'")
-    print(f"Temperature: {temperature}, Top-p: {top_p}, Top-k: {top_k}, Repetition penalty: {repetition_penalty}")
-    
-    # Prepare input for both models
-    messages = [
-        {"role": "system", "content": "You are Qwen, a helpful AI assistant. Provide detailed and thoughtful answers."},
-        {"role": "user", "content": test_prompt}
-    ]
-    
-    # JAX processing
-    print("\n--- JAX Model ---")
-    input_text = jax_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    jax_inputs = jax_tokenizer(input_text, return_tensors="np")
-    jax_input_ids = jax_inputs["input_ids"]
-    jax_batch, jax_seq = jax_input_ids.shape
-    jax_position_ids = jnp.arange(jax_seq)[None, :]
-    
-    # Get JAX logits
-    jax_outputs = jax_model.apply(jax_params, input_ids=jax_input_ids, position_ids=jax_position_ids, return_dict=True)
-    jax_logits = jax_outputs["logits"]
-    jax_last_logits = jax_logits[:, -1, :]  # Get logits for the last position
-    
-    # Sample from JAX logits with detailed debugging
-    print(f"JAX input length: {jax_seq}")
-    print(f"JAX logits shape: {jax_logits.shape}")
-    
-    # Debug JAX sampling step by step
-    jax_logits_clipped = jnp.clip(jax_last_logits, -20, 20)
-    jax_logits_scaled = jax_logits_clipped / temperature
-    
-    # Apply repetition penalty
-    if repetition_penalty != 1.0:
-        past_tokens = jax_input_ids[0].tolist()
-        for token in set(past_tokens[-50:]):
-            if token < jax_logits_scaled.shape[-1]:
-                if jax_logits_scaled[..., token] > 0:
-                    jax_logits_scaled = jax_logits_scaled.at[..., token].set(jax_logits_scaled[..., token] / repetition_penalty)
-                else:
-                    jax_logits_scaled = jax_logits_scaled.at[..., token].set(jax_logits_scaled[..., token] * repetition_penalty)
-    
-    # Top-k filtering
-    if top_k > 0:
-        top_logits, top_indices = jax.lax.top_k(jax_logits_scaled, min(top_k, jax_logits_scaled.shape[-1]))
-        mask = jnp.zeros_like(jax_logits_scaled, dtype=bool).at[..., top_indices].set(True)
-        jax_logits_scaled = jnp.where(mask, jax_logits_scaled, -jnp.inf)
-    
-    # Top-p (nucleus) sampling
-    if top_p < 1.0:
-        sorted_indices = jnp.argsort(jax_logits_scaled, axis=-1)[..., ::-1]
-        sorted_logits = jnp.take_along_axis(jax_logits_scaled, sorted_indices, axis=-1)
-        probs = jax.nn.softmax(sorted_logits, axis=-1)
-        cum_probs = jnp.cumsum(probs, axis=-1)
-        mask = cum_probs <= top_p
-        mask = mask.at[..., 0].set(True)  # Keep at least one token
-        jax_logits_scaled = jnp.where(jnp.take_along_axis(mask, jnp.argsort(sorted_indices, axis=-1), axis=-1), jax_logits_scaled, -jnp.inf)
-    
-    # Get final probabilities - use PyTorch softmax for consistency
-    jax_logits_tensor = torch.tensor(jax_logits_scaled)
-    jax_probs = torch.nn.functional.softmax(jax_logits_tensor, dim=-1)
-    jax_next_token = torch.multinomial(jax_probs, 1)
-    jax_token_id = int(jax_next_token[0])
-    jax_token_text = jax_tokenizer.decode(jax_token_id, skip_special_tokens=True)
-    
-    print(f"JAX selected token ID: {jax_token_id}")
-    print(f"JAX selected token text: '{jax_token_text}'")
-    print(f"JAX final logits range: [{float(jax_logits_scaled.min()):.6f}, {float(jax_logits_scaled.max()):.6f}]")
-    print(f"JAX non-inf tokens: {jnp.sum(jax_logits_scaled > -1e9)}")
-    
-    # PyTorch processing
-    print("\n--- PyTorch Model ---")
-    pytorch_inputs = pytorch_tokenizer(input_text, return_tensors="pt")
-    pytorch_input_ids = pytorch_inputs.input_ids
-    pytorch_batch, pytorch_seq = pytorch_input_ids.shape
-    
-    # Get PyTorch logits
-    with torch.no_grad():
-        pytorch_outputs = pytorch_model(pytorch_input_ids)
-        pytorch_logits = pytorch_outputs.logits
-        pytorch_last_logits = pytorch_logits[:, -1, :]  # Get logits for the last position
-    
-    # Sample from PyTorch logits using the same parameters
-    pytorch_logits_np = pytorch_last_logits.numpy()
-    
-    # Apply the same sampling logic as JAX
-    pytorch_logits_clipped = np.clip(pytorch_logits_np, -20, 20)
-    
-    # Apply repetition penalty
-    if repetition_penalty != 1.0:
-        past_tokens = pytorch_input_ids[0].tolist()
-        for token in set(past_tokens[-50:]):
-            if token < pytorch_logits_clipped.shape[-1]:
-                if pytorch_logits_clipped[..., token] > 0:
-                    pytorch_logits_clipped[..., token] /= repetition_penalty
-                else:
-                    pytorch_logits_clipped[..., token] *= repetition_penalty
-    
-    pytorch_logits_scaled = pytorch_logits_clipped / temperature
-    
-    # Top-k filtering
-    if top_k > 0:
-        top_indices = np.argsort(pytorch_logits_scaled, axis=-1)[..., -top_k:]
-        mask = np.zeros_like(pytorch_logits_scaled, dtype=bool)
-        mask[..., top_indices] = True
-        pytorch_logits_scaled = np.where(mask, pytorch_logits_scaled, -np.inf)
-    
-    # Top-p (nucleus) sampling
-    if top_p < 1.0:
-        sorted_indices = np.argsort(pytorch_logits_scaled, axis=-1)[..., ::-1]
-        sorted_logits = np.take_along_axis(pytorch_logits_scaled, sorted_indices, axis=-1)
-        probs = torch.nn.functional.softmax(torch.tensor(sorted_logits), dim=-1).numpy()
-        cum_probs = np.cumsum(probs, axis=-1)
-        mask = cum_probs <= top_p
-        mask[..., 0] = True  # Keep at least one token
-        pytorch_logits_scaled = np.where(np.take_along_axis(mask, np.argsort(sorted_indices, axis=-1), axis=-1), pytorch_logits_scaled, -np.inf)
-    
-    # Sample from PyTorch logits with detailed debugging
-    print(f"PyTorch input length: {pytorch_seq}")
-    print(f"PyTorch logits shape: {pytorch_logits.shape}")
-    
-    # Get final probabilities
-    torch.manual_seed(0)  # Set same randomness as JAX
-    pytorch_probs = torch.nn.functional.softmax(torch.tensor(pytorch_logits_scaled), dim=-1)
-    pytorch_next_token = torch.multinomial(pytorch_probs, 1)
-    pytorch_token_id = int(pytorch_next_token[0])
-    pytorch_token_text = pytorch_tokenizer.decode(pytorch_token_id, skip_special_tokens=True)
-    
-    print(f"PyTorch selected token ID: {pytorch_token_id}")
-    print(f"PyTorch selected token text: '{pytorch_token_text}'")
-    print(f"PyTorch final logits range: [{float(pytorch_logits_scaled.min()):.6f}, {float(pytorch_logits_scaled.max()):.6f}]")
-    print(f"PyTorch non-inf tokens: {np.sum(pytorch_logits_scaled > -1e9)}")
-    
-    # Compare top probabilities
-    jax_probs_np = jax_probs.float().numpy()
-    jax_top_probs, jax_top_indices = jax.lax.top_k(jnp.array(jax_probs_np), 5)
-    pytorch_top_probs, pytorch_top_indices = torch.topk(pytorch_probs.float(), 5, dim=-1)
-    
-    print(f"\n--- TOP 5 PROBABILITIES COMPARISON ---")
-    print(f"JAX top 5 probabilities:")
-    for i in range(5):
-        token_text = jax_tokenizer.decode(int(jax_top_indices[0, i]), skip_special_tokens=True)
-        print(f"  {i+1}. ID {int(jax_top_indices[0, i])} ('{token_text}'): {float(jax_top_probs[0, i]):.6f}")
-    
-    print(f"PyTorch top 5 probabilities:")
-    for i in range(5):
-        token_text = pytorch_tokenizer.decode(int(pytorch_top_indices[0, i]), skip_special_tokens=True)
-        print(f"  {i+1}. ID {int(pytorch_top_indices[0, i])} ('{token_text}'): {float(pytorch_top_probs[0, i]):.6f}")
-    
-    # Compare results
-    print(f"\n--- COMPARISON RESULTS ---")
-    print(f"Token ID match: {jax_token_id == pytorch_token_id}")
-    print(f"Token text match: {jax_token_text == pytorch_token_text}")
-    
-    if jax_token_id != pytorch_token_id:
-        print(f"\n--- LOGITS DIFFERENCES ---")
-        print(f"JAX logits range: [{float(jax_last_logits.min()):.6f}, {float(jax_last_logits.max()):.6f}]")
-        print(f"PyTorch logits range: [{float(pytorch_last_logits.min()):.6f}, {float(pytorch_last_logits.max()):.6f}]")
-        
-        # Compare top-k logits
-        jax_top_k_indices = jnp.argsort(jax_last_logits, axis=-1)[..., -10:]
-        pytorch_top_k_indices = torch.argsort(pytorch_last_logits, dim=-1)[..., -10:]
-        
-        print(f"\nTop 10 JAX logits:")
-        for i, idx in enumerate(jax_top_k_indices[0]):
-            token_text = jax_tokenizer.decode(int(idx), skip_special_tokens=True)
-            print(f"  {i+1}. ID {int(idx)} ('{token_text}'): {float(jax_last_logits[0, int(idx)]):.6f}")
-        
-        print(f"\nTop 10 PyTorch logits:")
-        for i, idx in enumerate(pytorch_top_k_indices[0]):
-            token_text = pytorch_tokenizer.decode(int(idx), skip_special_tokens=True)
-            print(f"  {i+1}. ID {int(idx)} ('{token_text}'): {float(pytorch_last_logits[0, int(idx)]):.6f}")
-    
-    return jax_token_id == pytorch_token_id, jax_token_text == pytorch_token_text
+    # Use PyTorch's more stable softmax and multinomial sampling
+    logits_tensor = torch.tensor(logits)
+    probs = torch.nn.functional.softmax(logits_tensor, dim=-1)
+    torch.manual_seed(seed)  # Set random state for consistency
+    next_token = torch.multinomial(probs, 1)
+    return jnp.array(next_token.item())
 
 def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1):
     messages = [
@@ -472,20 +288,20 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k, repetition_penalty, generated_tokens, seed=i)
-        generated_tokens.append(int(next_token[0]))
-        input_ids = next_token[:, None]
+        generated_tokens.append(int(next_token))
+        input_ids = next_token[None, None]
         position_ids = position_ids[:, -1:] + 1
         past_key_values = [(jnp.zeros_like(kv[0]), jnp.zeros_like(kv[1])) if kv is None else kv for kv in past_key_values]
-        token = tokenizer.decode(next_token[0], skip_special_tokens=True)
+        token = tokenizer.decode(int(next_token), skip_special_tokens=True)
         print(token, end="", flush=True)
-        if next_token[0] == tokenizer.eos_token_id or "<|im_end|>" in token:
+        if int(next_token) == tokenizer.eos_token_id or "<|im_end|>" in token:
             break
     print()
     return tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference with PyTorch Comparison")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max_tokens", type=int, default=256)
@@ -494,40 +310,14 @@ def main():
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
-    parser.add_argument("--compare_sampling", action="store_true", help="Compare first token sampling with PyTorch")
     args = parser.parse_args()
 
-    dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32  # Revert to bfloat16 for stability
+    dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
     with open(os.path.join(args.model_path, "config.json")) as f:
         config = json.load(f)
     model = Qwen25ForCausalLM(config=config, dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
-
-    # Step 3: Compare first token sampling if requested
-    if args.compare_sampling:
-        try:
-            pytorch_model, pytorch_tokenizer = load_pytorch_model(args.model_path)
-            token_match, text_match = compare_first_token_sampling(
-                model, params, tokenizer, pytorch_model, pytorch_tokenizer,
-                test_prompt="Janet's dogs eat",
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-                repetition_penalty=args.repetition_penalty
-            )
-            
-            if token_match and text_match:
-                print(f"\n✅ SUCCESS: JAX and PyTorch sampling match!")
-                print("Proceeding with full generation...")
-            else:
-                print(f"\n❌ MISMATCH: JAX and PyTorch sampling differ!")
-                print("Check logits differences above for debugging.")
-                return
-                
-        except Exception as e:
-            print(f"Error during sampling comparison: {e}")
-            print("Continuing with generation anyway...")
 
     generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature, args.top_p, args.top_k, args.repetition_penalty)
 
