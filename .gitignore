@@ -28,3 +28,7 @@ bindist/
 
 # Model weights
 tests/jax/multi_chip/bounties/qwen2.5-7b/weights/
+venv_new/bin/activate
+
+venv/
+venv_new/
