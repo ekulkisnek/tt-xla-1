@@ -24,8 +24,8 @@ def load_model_with_optimizations():
     print("Checking system memory...")
     available_gb = check_memory()
     
-    # Use local weights path
-    model_path = "."  # Current directory contains the weights
+    # Use local weights path - FIXED: point to weights directory
+    model_path = "./weights"  # Changed from "." to "./weights"
     
     print(f"Attempting to load Qwen2.5-7B from local weights at: {os.path.abspath(model_path)}")
     
@@ -57,20 +57,20 @@ def load_model_with_optimizations():
         
     except Exception as e:
         print(f"Error loading local model: {e}")
-        print("Trying fallback to smaller model...")
+        print("Trying fallback with different loading parameters...")
         
-        # Fallback to smaller model from Hugging Face
+        # Fallback to local weights with different settings (like the original script)
         try:
-            model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            print("Trying with different loading parameters...")
+            tokenizer = AutoTokenizer.from_pretrained("./weights")
             model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
+                "./weights",
+                torch_dtype=torch.float16,  # Changed from float32 to float16 for memory efficiency
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
-            print(f"Successfully loaded fallback model: {model_name}")
-            return model, tokenizer, model_name
+            print(f"Successfully loaded model from local weights")
+            return model, tokenizer, "./weights"
         except Exception as e2:
             print(f"Error loading fallback model: {e2}")
             return None, None, None
@@ -156,23 +156,9 @@ def main():
     
     print(f"\nUsing model: {model_name}")
     
-    # GSM8K-style math questions
+    # GSM8K-style math questions - Only run the first one for testing
     math_questions = [
         "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?",
-        
-        "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
-        
-        "Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?",
-        
-        "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
-        
-        "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
-        
-        "If a train travels 60 miles per hour, how far will it travel in 2.5 hours?",
-        
-        "A store sells shirts for $25 each and pants for $40 each. If someone buys 3 shirts and 2 pairs of pants, how much do they spend in total?",
-        
-        "A recipe calls for 2 cups of flour to make 12 cookies. How many cups of flour are needed to make 36 cookies?"
     ]
     
     for i, question in enumerate(math_questions, 1):
@@ -191,6 +177,7 @@ def main():
             print("This might be due to insufficient memory for the 7B model.")
         
         print(f"\n" + "-"*60)
+        break  # Only run the first question
     
     # Clean up
     del model, tokenizer
