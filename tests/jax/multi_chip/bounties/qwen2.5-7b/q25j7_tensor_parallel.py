@@ -35,7 +35,7 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 import jax
 import jax.numpy as jnp
@@ -471,8 +471,8 @@ def main():
     print("\n=== QUICK TEST MODE ===")
     test_sample = {"question": "What is 2 + 2?", "answer": "4"}
     print(f"Testing with: {test_sample['question']}")
-    # Generate just 3 tokens for quick testing
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 3, test_sample["question"])
+    # Generate 5 tokens for testing tensor parallelism benefits
+    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 5, test_sample["question"])
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
