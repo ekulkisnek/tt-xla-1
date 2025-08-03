@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-Self-contained Qwen2.5-7B-Instruct inference script for single-device JAX with FINAL OPTIMIZED Step 3 equivalence testing.
+Self-contained Qwen2.5-7B-Instruct inference script for single-device JAX optimized for Step 7: GSM8K Benchmark.
 - Fixed rotary embeddings (RoPE) with proper broadcasting.
 - Corrected GQA attention mechanism for shape compatibility.
 - Optimized sampling to prevent repetitive outputs.
 - Enhanced for GSM8K-style math problems.
-- FINAL OPTIMIZED: Basic token comparison only, no timeouts, guaranteed completion.
+- Greedy sampling (temperature=0) for deterministic outputs.
+- Hardcoded GSM8K benchmarking with 10 samples.
+- Generalized text generation for multiple prompts.
+- Answer extraction with boxed format support.
+- Detailed memory monitoring with psutil (peak per sample).
+- Timing for generation speed (avg seconds per token).
 - JAX_ENABLE_X64 disabled globally for faster inference.
-- GSM8K functional check for math problems.
-- Memory monitoring with psutil.
-- Greedy sampling (temperature=0) for deterministic comparison tests.
-- Hardcoded full GSM8K prompt for consistent testing.
 - Default bfloat16 for faster inference.
 - Pure JAX sampling (no PyTorch dependency).
 - Enhanced memory management with GC collects.
-- Generalized text generation for multiple prompts.
-- GSM8K benchmarking with 10 samples.
-- Answer extraction with boxed format support.
 
 Usage:
-python q25jax3c.py --model_path weights --compare_sampling
+python q25j7.py --model_path weights
 """
 import os
 import sys
@@ -28,6 +26,7 @@ import argparse
 import logging
 import psutil
 import gc
+import time
 import jax.random
 from typing import Dict, Any, Optional, Tuple
 
@@ -37,16 +36,15 @@ os.environ["JAX_ENABLE_X64"] = "0"
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
 from safetensors import safe_open
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from flax import linen as nn
 
 
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("qwen25_final")
+logger = logging.getLogger("qwen25_step7")
 
 # --- Model Code ---
 class QwenAttention(nn.Module):
@@ -191,10 +189,7 @@ class Qwen25ForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = jnp.ones((batch, 1, seq, key_len), dtype=self.dtype)
         causal_mask = make_causal_mask(seq, key_len)[None, None, :, :]
-        if attention_mask is not None:
-            attention_bias = jnp.where(attention_mask == 0, -1e9, 0) + causal_mask
-        else:
-            attention_bias = causal_mask
+        attention_bias = jnp.where(attention_mask == 0, -1e9, 0) + causal_mask
 
         hidden_states = self.embed_tokens(input_ids)
         if past_key_values is None:
@@ -276,53 +271,57 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
     past_key_values = None
     generated_tokens = input_ids[0].tolist()
 
-    print(f"Memory before generation: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+    start_time = time.perf_counter()
+    peak_mem = psutil.virtual_memory().used / (1024**3)
+    print(f"Initial memory before generation: {peak_mem:.2f} GB used")
     print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
 
+    num_tokens_generated = 0
     for i in range(max_tokens):
         outputs = model.apply(params, input_ids=input_ids, position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         next_token = sample_next_token(logits[:, -1, :])
         generated_tokens.append(int(next_token))
-        input_ids = jnp.array([[next_token]])  # Fixed: Use next_token directly
+        input_ids = jnp.array([[next_token]])
         position_ids = position_ids[:, -1:] + 1
-            
+        num_tokens_generated += 1
+        
+        # Update peak mem
+        current_mem = psutil.virtual_memory().used / (1024**3)
+        if current_mem > peak_mem:
+            peak_mem = current_mem
+        
         token = tokenizer.decode(int(next_token), skip_special_tokens=True)
-        print(token, end="", flush=True)
-        print(f"Gen token {i+1}/{max_tokens}: {token}")  # Progress indicator
+        print(f"Gen token {i+1}/{max_tokens}: {token}")
         if int(next_token) == tokenizer.eos_token_id or "<|im_end|>" in token:
             break
     
+    end_time = time.perf_counter()
+    total_time = end_time - start_time
+    avg_time_per_token = total_time / num_tokens_generated if num_tokens_generated > 0 else 0
+    
     print(f"\nMemory after generation: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+    print(f"Peak memory during generation: {peak_mem:.2f} GB used")
     print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-    print()
+    print(f"Total tokens generated: {num_tokens_generated}")
+    print(f"Average time per token: {avg_time_per_token:.2f} seconds")
     
     full_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     
-    # GSM8K check (conditional)
-    if "dog food" in prompt.lower():
-        import re
-        match = re.search(r'\\boxed{([0-9]+)}|(\d+) days', full_output)
-        if match and (match.group(1) or match.group(2)) == '25':
-            print("✅ GSM8K functional pass: Found '25' in output")
-        else:
-            print(f"⚠️  GSM8K check: Expected '25', found: {match.group(1) if match and match.group(1) else match.group(2) if match and match.group(2) else 'no match'}")
-    
-    return full_output
+    return full_output, peak_mem, avg_time_per_token
 
 def extract_answer(output: str) -> str:
     """Extract numerical answer from model output."""
     import re
-    match = re.search(r'\\boxed{([0-9]+)}', output)
+    match = re.search(r'\\boxed\{([0-9]+)\}', output)
     return match.group(1) if match else None
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference for GSM8K Benchmark")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
-    parser.add_argument("--compare_sampling", action="store_true", help="Compare first token sampling with PyTorch")
     args = parser.parse_args()
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -333,101 +332,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    if args.compare_sampling:
-        try:
-            # Load PyTorch model for comparison
-            print("Loading PyTorch model for comparison...")
-            pytorch_tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-            pytorch_model = AutoModelForCausalLM.from_pretrained(
-                args.model_path,
-                torch_dtype=torch.bfloat16,  # Use bfloat16 for consistency
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
-            gc.collect()  # Add GC collect after PyTorch model load
-            
-            # Basic compare only - fastest, focuses on Step 3 core
-            print(f"\n=== BASIC FIRST TOKEN COMPARISON ===")
-            # Test with a simple math question
-            test_prompt = "What is 2+2?"
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": test_prompt}
-            ]
-            
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            jax_inputs = tokenizer(input_text, return_tensors="np")
-            pytorch_inputs = pytorch_tokenizer(input_text, return_tensors="pt")
-            
-            jax_input_ids = jax_inputs["input_ids"]
-            pytorch_input_ids = pytorch_inputs.input_ids
-            jax_seq = jax_input_ids.shape[1]
-            jax_position_ids = jnp.arange(jax_seq)[None, :]
-            
-            # Get logits
-            print(f"Memory before JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect before JAX forward
-            
-            # JAX forward pass
-            jax_outputs = model.apply(params, input_ids=jax_input_ids, position_ids=jax_position_ids, return_dict=True)
-            jax_logits = jax_outputs["logits"]
-            
-            print(f"Memory after JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect after JAX forward
-            
-            print(f"Memory before PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect before PyTorch forward
-            
-            # PyTorch forward pass
-            with torch.no_grad():
-                pytorch_outputs = pytorch_model(pytorch_input_ids)
-                pytorch_logits = pytorch_outputs.logits
-            
-            print(f"Memory after PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect after PyTorch forward
-            
-            # Sample tokens
-            jax_next_token = sample_next_token(jax_logits[:, -1, :])
-            
-            # Sample next token from PyTorch logits
-            pytorch_last_logits = pytorch_logits[0, -1, :].numpy()
-            pytorch_next_token = torch.argmax(torch.tensor(pytorch_last_logits), dim=-1).item()
-            
-            # Compare tokens
-            jax_token_id = int(jax_next_token)
-            pytorch_token_id = pytorch_next_token
-            
-            print(f"JAX token ID: {jax_token_id}")
-            print(f"PyTorch token ID: {pytorch_token_id}")
-            print(f"Token match: {jax_token_id == pytorch_token_id}")
-            
-            if jax_token_id == pytorch_token_id:
-                print("✅ Step 3 passed: JAX and PyTorch first token match!")
-                print("Step 3 passed, proceeding")
-            else:
-                print(f"❌ Step 3 failed: Token mismatch (JAX: {jax_token_id}, PyTorch: {pytorch_token_id})")
-                print("Continuing with generation anyway...")
-        except Exception as e:
-            print(f"Error during sampling comparison: {e}")
-            print("Continuing with generation anyway...")
-
-    # Always run generation (even if not 100% pass rate)
-    print(f"\nFunctional test: Generation output")
-    gc.collect()  # Add GC collect before generation
-    
-    # Always use the same model for generation
-    output = generate_text(model, params, tokenizer, 256, "What is 2+2?")
-    
-    print(f"\n🎉 Step 3 complete: JAX Qwen2.5-7B-Instruct inference successful!")
-    print(f"Generated text: {output}")
-    
     # Benchmark on 10 GSM8K samples
-    print("\nRunning benchmark on 10 GSM8K samples...")
+    print("\nRunning GSM8K benchmark on 10 samples...")
     gsm8k_samples = [
+        {"question": "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag, how many days will it last?", "answer": "25"},
         {"question": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?", "answer": "72"},
         {"question": "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?", "answer": "10"},
         {"question": "Betty is saving money for a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?", "answer": "5"},
@@ -441,17 +349,29 @@ def main():
     ]
     
     correct_count = 0
+    total_peak_mem = 0
+    total_avg_time_per_token = 0
     for i, sample in enumerate(gsm8k_samples):
-        print(f"\n--- Sample {i+1}/10 ---")
-        output = generate_text(model, params, tokenizer, 256, sample["question"])
+        print(f"\n--- Sample {i+1}/{len(gsm8k_samples)}: {sample['question']} ---")
+        gc.collect()  # GC before each sample
+        output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 256, sample["question"])
         pred = extract_answer(output)
-        if pred == sample["answer"]:
+        is_correct = pred == sample["answer"]
+        if is_correct:
             correct_count += 1
-        print(f"Prompt: {sample['question']}")
+        total_peak_mem += peak_mem
+        total_avg_time_per_token += avg_time_per_token
         print(f"Predicted: {pred}")
-        print(f"Correct: {pred == sample['answer']}")
+        print(f"Expected: {sample['answer']}")
+        print(f"Correct: {is_correct}")
     
-    print(f"\nBenchmark Accuracy: {correct_count / 10 * 100:.2f}%")
+    avg_peak_mem = total_peak_mem / len(gsm8k_samples)
+    avg_time_per_token = total_avg_time_per_token / len(gsm8k_samples)
+    accuracy = correct_count / len(gsm8k_samples) * 100
+    print("\nBenchmark Summary:")
+    print(f"Accuracy: {accuracy:.2f}% ({correct_count}/{len(gsm8k_samples)} correct)")
+    print(f"Average Peak Memory per Sample: {avg_peak_mem:.2f} GB")
+    print(f"Average Time per Token: {avg_time_per_token:.2f} seconds")
 
 
 if __name__ == "__main__":

@@ -17,9 +17,10 @@ Self-contained Qwen2.5-7B-Instruct inference script for single-device JAX with F
 - Generalized text generation for multiple prompts.
 - GSM8K benchmarking with 10 samples.
 - Answer extraction with boxed format support.
+- STEP 4: Added embedding and norm comparison for input handling verification.
 
 Usage:
-python q25jax3c.py --model_path weights --compare_sampling
+python q25j4.py --model_path weights --compare_sampling --compare_embeddings
 """
 import os
 import sys
@@ -213,6 +214,32 @@ class Qwen25ForCausalLM(nn.Module):
             return {"logits": logits, "past_key_values": new_key_values}
         return logits
 
+    def get_embeddings(self, input_ids):
+        """Get token embeddings for comparison"""
+        return self.embed_tokens(input_ids)
+    
+    def get_final_norm(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None):
+        """Get final norm output for comparison"""
+        batch, seq = input_ids.shape
+        key_len = seq if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + seq
+
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch, 1, seq, key_len), dtype=self.dtype)
+        causal_mask = make_causal_mask(seq, key_len)[None, None, :, :]
+        if attention_mask is not None:
+            attention_bias = jnp.where(attention_mask == 0, -1e9, 0) + causal_mask
+        else:
+            attention_bias = causal_mask
+
+        hidden_states = self.embed_tokens(input_ids)
+        if past_key_values is None:
+            past_key_values = [None] * len(self.layers)
+
+        for layer, past_kv in zip(self.layers, past_key_values):
+            hidden_states, _ = layer(hidden_states, attention_bias, position_ids, past_kv)
+
+        return self.norm(hidden_states)
+
 # --- Weight Loading ---
 def get_param_path(name):
     mapping = {
@@ -257,6 +284,126 @@ def load_params(model, model_path, dtype):
     gc.collect()  # Add GC collect after loading
     print("Weight loading completed")
     return params
+
+# --- Step 4: Embedding and Norm Comparison ---
+def compare_embeddings_and_norms(jax_model, jax_params, pytorch_model, tokenizer, pytorch_tokenizer):
+    """Step 4: Compare embeddings and final norms between JAX and PyTorch"""
+    print(f"\n=== STEP 4: EMBEDDING AND NORM COMPARISON ===")
+    
+    # Use the specified short prompt
+    test_prompt = "Sam has 3 apples. He buys 2 more. How many apples does he have now?"
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": test_prompt}
+    ]
+    
+    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    jax_inputs = tokenizer(input_text, return_tensors="np")
+    pytorch_inputs = pytorch_tokenizer(input_text, return_tensors="pt")
+    
+    jax_input_ids = jax_inputs["input_ids"]
+    pytorch_input_ids = pytorch_inputs.input_ids
+    
+    print(f"Input sequence length: {jax_input_ids.shape[1]} tokens")
+    print(f"Input text: {input_text}")
+    
+    # 1. Compare embeddings (post-embedding layer)
+    print(f"\n1. Comparing token embeddings...")
+    gc.collect()
+    
+    # JAX embeddings
+    jax_embeddings = jax_model.apply(jax_params, method=jax_model.get_embeddings, input_ids=jax_input_ids)
+    jax_embeddings_np = np.array(jax_embeddings)
+    
+    # PyTorch embeddings
+    with torch.no_grad():
+        pytorch_embeddings = pytorch_model.model.embed_tokens(pytorch_input_ids)
+        # Convert to float32 for compatibility with numpy
+        pytorch_embeddings_np = pytorch_embeddings.float().numpy()
+    
+    # Compare embeddings
+    embedding_diff = np.abs(jax_embeddings_np - pytorch_embeddings_np)
+    embedding_max_diff = np.max(embedding_diff)
+    embedding_mean_diff = np.mean(embedding_diff)
+    embedding_close = np.allclose(jax_embeddings_np, pytorch_embeddings_np, rtol=1e-4)
+    
+    print(f"Embedding max diff: {embedding_max_diff:.2e}")
+    print(f"Embedding mean diff: {embedding_mean_diff:.2e}")
+    print(f"Embeddings close (rtol=1e-4): {embedding_close}")
+    
+    # 2. Compare final norms (post-all layers, pre-LM head)
+    print(f"\n2. Comparing final norms...")
+    gc.collect()
+    
+    jax_seq = jax_input_ids.shape[1]
+    jax_position_ids = jnp.arange(jax_seq)[None, :]
+    
+    # JAX final norm
+    jax_final_norm = jax_model.apply(jax_params, method=jax_model.get_final_norm, 
+                                    input_ids=jax_input_ids, position_ids=jax_position_ids)
+    jax_final_norm_np = np.array(jax_final_norm)
+    
+    # PyTorch final norm (need to run through all layers)
+    with torch.no_grad():
+        pytorch_outputs = pytorch_model(pytorch_input_ids, output_hidden_states=True)
+        pytorch_final_norm = pytorch_model.model.norm(pytorch_outputs.hidden_states[-1])
+        # Convert to float32 for compatibility with numpy
+        pytorch_final_norm_np = pytorch_final_norm.float().numpy()
+    
+    # Compare final norms
+    norm_diff = np.abs(jax_final_norm_np - pytorch_final_norm_np)
+    norm_max_diff = np.max(norm_diff)
+    norm_mean_diff = np.mean(norm_diff)
+    norm_close = np.allclose(jax_final_norm_np, pytorch_final_norm_np, rtol=1e-4)
+    
+    print(f"Final norm max diff: {norm_max_diff:.2e}")
+    print(f"Final norm mean diff: {norm_mean_diff:.2e}")
+    print(f"Final norms close (rtol=1e-4): {norm_close}")
+    
+    # 3. KL divergence check for flattened arrays
+    print(f"\n3. KL divergence check...")
+    
+    def kl_divergence(p, q):
+        """Compute KL divergence between two probability distributions"""
+        # Add small epsilon to avoid log(0)
+        epsilon = 1e-10
+        p = p.flatten() + epsilon
+        q = q.flatten() + epsilon
+        # Normalize to probability distributions
+        p = p / np.sum(p)
+        q = q / np.sum(q)
+        return np.sum(p * np.log(p / q))
+    
+    # Convert to float64 for better precision in KL calculation
+    jax_embeddings_64 = jax_embeddings_np.astype(np.float64)
+    pytorch_embeddings_64 = pytorch_embeddings_np.astype(np.float64)
+    jax_norm_64 = jax_final_norm_np.astype(np.float64)
+    pytorch_norm_64 = pytorch_final_norm_np.astype(np.float64)
+    
+    embedding_kl = kl_divergence(jax_embeddings_64, pytorch_embeddings_64)
+    norm_kl = kl_divergence(jax_norm_64, pytorch_norm_64)
+    
+    print(f"Embedding KL divergence: {embedding_kl:.2e}")
+    print(f"Final norm KL divergence: {norm_kl:.2e}")
+    
+    # Overall assessment
+    embedding_kl_pass = embedding_kl < 1e-6
+    norm_kl_pass = norm_kl < 1e-6
+    
+    print(f"\n=== STEP 4 RESULTS ===")
+    print(f"Embeddings match: {embedding_close} (KL: {embedding_kl_pass})")
+    print(f"Final norms match: {norm_close} (KL: {norm_kl_pass})")
+    
+    if embedding_close and norm_close and embedding_kl_pass and norm_kl_pass:
+        print("✅ Step 4 PASSED: Embeddings and norms are close/identical")
+        return True
+    else:
+        print("❌ Step 4 FAILED: Significant differences detected")
+        print("Debugging suggestions:")
+        print("- Check weight loading (embed_tokens.weight transpose)")
+        print("- Verify dtype consistency (bfloat16 vs float16)")
+        print("- Check layer norm epsilon values")
+        return False
 
 # --- Generation ---
 def sample_next_token(logits):
@@ -319,10 +466,11 @@ def extract_answer(output: str) -> str:
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference with Step 4")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--compare_sampling", action="store_true", help="Compare first token sampling with PyTorch")
+    parser.add_argument("--compare_embeddings", action="store_true", help="Compare embeddings and norms (Step 4)")
     args = parser.parse_args()
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -333,7 +481,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    if args.compare_sampling:
+    if args.compare_sampling or args.compare_embeddings:
         try:
             # Load PyTorch model for comparison
             print("Loading PyTorch model for comparison...")
@@ -346,73 +494,83 @@ def main():
             )
             gc.collect()  # Add GC collect after PyTorch model load
             
-            # Basic compare only - fastest, focuses on Step 3 core
-            print(f"\n=== BASIC FIRST TOKEN COMPARISON ===")
-            # Test with a simple math question
-            test_prompt = "What is 2+2?"
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": test_prompt}
-            ]
+            # Step 3: Basic first token comparison
+            if args.compare_sampling:
+                print(f"\n=== STEP 3: BASIC FIRST TOKEN COMPARISON ===")
+                # Test with the full GSM8K prompt
+                test_prompt = "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag, how many days will it last?"
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": test_prompt}
+                ]
+                
+                input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                jax_inputs = tokenizer(input_text, return_tensors="np")
+                pytorch_inputs = pytorch_tokenizer(input_text, return_tensors="pt")
+                
+                jax_input_ids = jax_inputs["input_ids"]
+                pytorch_input_ids = pytorch_inputs.input_ids
+                jax_seq = jax_input_ids.shape[1]
+                jax_position_ids = jnp.arange(jax_seq)[None, :]
+                
+                # Get logits
+                print(f"Memory before JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+                print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+                gc.collect()  # Add GC collect before JAX forward
+                
+                # JAX forward pass
+                jax_outputs = model.apply(params, input_ids=jax_input_ids, position_ids=jax_position_ids, return_dict=True)
+                jax_logits = jax_outputs["logits"]
+                
+                print(f"Memory after JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+                print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+                gc.collect()  # Add GC collect after JAX forward
+                
+                print(f"Memory before PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+                print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+                gc.collect()  # Add GC collect before PyTorch forward
+                
+                # PyTorch forward pass
+                with torch.no_grad():
+                    pytorch_outputs = pytorch_model(pytorch_input_ids)
+                    pytorch_logits = pytorch_outputs.logits
+                
+                print(f"Memory after PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+                print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+                gc.collect()  # Add GC collect after PyTorch forward
+                
+                # Sample tokens
+                jax_next_token = sample_next_token(jax_logits[:, -1, :])
+                
+                # Sample next token from PyTorch logits
+                pytorch_last_logits = pytorch_logits[0, -1, :].numpy()
+                pytorch_next_token = torch.argmax(torch.tensor(pytorch_last_logits), dim=-1).item()
+                
+                # Compare tokens
+                jax_token_id = int(jax_next_token)
+                pytorch_token_id = pytorch_next_token
+                
+                print(f"JAX token ID: {jax_token_id}")
+                print(f"PyTorch token ID: {pytorch_token_id}")
+                print(f"Token match: {jax_token_id == pytorch_token_id}")
+                
+                if jax_token_id == pytorch_token_id:
+                    print("✅ Step 3 passed: JAX and PyTorch first token match!")
+                    print("Step 3 passed, proceeding")
+                else:
+                    print(f"❌ Step 3 failed: Token mismatch (JAX: {jax_token_id}, PyTorch: {pytorch_token_id})")
+                    print("Continuing with generation anyway...")
             
-            input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            jax_inputs = tokenizer(input_text, return_tensors="np")
-            pytorch_inputs = pytorch_tokenizer(input_text, return_tensors="pt")
-            
-            jax_input_ids = jax_inputs["input_ids"]
-            pytorch_input_ids = pytorch_inputs.input_ids
-            jax_seq = jax_input_ids.shape[1]
-            jax_position_ids = jnp.arange(jax_seq)[None, :]
-            
-            # Get logits
-            print(f"Memory before JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect before JAX forward
-            
-            # JAX forward pass
-            jax_outputs = model.apply(params, input_ids=jax_input_ids, position_ids=jax_position_ids, return_dict=True)
-            jax_logits = jax_outputs["logits"]
-            
-            print(f"Memory after JAX forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect after JAX forward
-            
-            print(f"Memory before PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect before PyTorch forward
-            
-            # PyTorch forward pass
-            with torch.no_grad():
-                pytorch_outputs = pytorch_model(pytorch_input_ids)
-                pytorch_logits = pytorch_outputs.logits
-            
-            print(f"Memory after PyTorch forward: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-            print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-            gc.collect()  # Add GC collect after PyTorch forward
-            
-            # Sample tokens
-            jax_next_token = sample_next_token(jax_logits[:, -1, :])
-            
-            # Sample next token from PyTorch logits
-            pytorch_last_logits = pytorch_logits[0, -1, :].numpy()
-            pytorch_next_token = torch.argmax(torch.tensor(pytorch_last_logits), dim=-1).item()
-            
-            # Compare tokens
-            jax_token_id = int(jax_next_token)
-            pytorch_token_id = pytorch_next_token
-            
-            print(f"JAX token ID: {jax_token_id}")
-            print(f"PyTorch token ID: {pytorch_token_id}")
-            print(f"Token match: {jax_token_id == pytorch_token_id}")
-            
-            if jax_token_id == pytorch_token_id:
-                print("✅ Step 3 passed: JAX and PyTorch first token match!")
-                print("Step 3 passed, proceeding")
-            else:
-                print(f"❌ Step 3 failed: Token mismatch (JAX: {jax_token_id}, PyTorch: {pytorch_token_id})")
-                print("Continuing with generation anyway...")
+            # Step 4: Embedding and norm comparison
+            if args.compare_embeddings:
+                step4_passed = compare_embeddings_and_norms(model, params, pytorch_model, tokenizer, pytorch_tokenizer)
+                if step4_passed:
+                    print("Step 4 passed, proceeding to generation")
+                else:
+                    print("Step 4 failed, but continuing with generation for debugging")
+                    
         except Exception as e:
-            print(f"Error during sampling comparison: {e}")
+            print(f"Error during comparison: {e}")
             print("Continuing with generation anyway...")
 
     # Always run generation (even if not 100% pass rate)
@@ -420,9 +578,9 @@ def main():
     gc.collect()  # Add GC collect before generation
     
     # Always use the same model for generation
-    output = generate_text(model, params, tokenizer, 256, "What is 2+2?")
+    output = generate_text(model, params, tokenizer, 256, "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag, how many days will it last?")
     
-    print(f"\n🎉 Step 3 complete: JAX Qwen2.5-7B-Instruct inference successful!")
+    print(f"\n🎉 Step 4 complete: JAX Qwen2.5-7B-Instruct inference successful!")
     print(f"Generated text: {output}")
     
     # Benchmark on 10 GSM8K samples

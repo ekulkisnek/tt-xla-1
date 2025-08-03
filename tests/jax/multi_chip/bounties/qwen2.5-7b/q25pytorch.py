@@ -156,9 +156,9 @@ def main():
     
     print(f"\nUsing model: {model_name}")
     
-    # GSM8K-style math questions - Only run the first one for testing
+    # Simple math question for quick testing
     math_questions = [
-        "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag of dog food, how many days will it last?",
+        "What is 2+2?",
     ]
     
     for i, question in enumerate(math_questions, 1):
@@ -169,7 +169,7 @@ def main():
         print("RESPONSE:")
         
         try:
-            response = generate_response(model, tokenizer, question, max_new_tokens=256)
+            response = generate_response(model, tokenizer, question, max_new_tokens=512)
             print(response)
             
         except Exception as e:
