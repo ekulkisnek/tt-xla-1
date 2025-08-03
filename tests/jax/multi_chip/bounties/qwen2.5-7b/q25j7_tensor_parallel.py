@@ -35,7 +35,7 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
 
 import jax
 import jax.numpy as jnp
@@ -195,10 +195,25 @@ class QwenMLP(nn.Module):
     def setup(self):
         c = self.config
         self.intermediate_size = c.get("intermediate_size", 4 * c["hidden_size"])
-        # Use regular Dense layers - tensor parallelism handled at forward pass level
-        self.gate_proj = nn.Dense(self.intermediate_size, dtype=jnp.bfloat16, use_bias=False, name="gate_proj")
-        self.up_proj = nn.Dense(self.intermediate_size, dtype=jnp.bfloat16, use_bias=False, name="up_proj")
-        self.down_proj = nn.Dense(c["hidden_size"], dtype=jnp.bfloat16, use_bias=False, name="down_proj")
+        # Use ParallelDense for tensor parallelism
+        self.gate_proj = ParallelDense(
+            self.intermediate_size,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            name="gate_proj"
+        )
+        self.up_proj = ParallelDense(
+            self.intermediate_size,
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            name="up_proj"
+        )
+        self.down_proj = ParallelDense(
+            c["hidden_size"],
+            dtype=self.dtype,
+            param_dtype=self.dtype,
+            name="down_proj"
+        )
 
     def __call__(self, x):
         return self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -234,7 +249,7 @@ class Qwen25ForCausalLM(nn.Module):
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
         # Use ParallelDense for tensor parallelism
-        self.lm_head = nn.Dense(c["vocab_size"], dtype=jnp.bfloat16, use_bias=False, name="lm_head")
+        self.lm_head = ParallelDense(c["vocab_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="lm_head")
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
         batch, seq = input_ids.shape
@@ -344,8 +359,8 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
         gathered_logits = jnp.reshape(jnp.transpose(gathered_logits, (1, 2, 0, 3)), (logits.shape[0], logits.shape[1], -1))
         return gathered_logits, outputs["past_key_values"]
 
-    # Create sharding specs for comprehensive tensor parallelism
-    # Shard all major weight matrices across devices
+    # Create sharding specs for tensor parallelism
+    # Focus on MLP and lm_head layers which work well
     def create_sharding_specs(params):
         specs = {}
         for key, value in params.items():
@@ -353,19 +368,13 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
                 if 'mlp' in key or 'lm_head' in key:
                     # Shard output dimension for MLP and lm_head
                     specs[key] = P(None, "mp")
-                elif 'q_proj' in key or 'k_proj' in key or 'v_proj' in key:
-                    # Shard output dimension for attention projections
-                    specs[key] = P(None, "mp")
-                elif 'o_proj' in key:
-                    # Shard input dimension for output projection
-                    specs[key] = P("mp", None)
                 else:
                     specs[key] = P()
             else:
                 specs[key] = P()
         return specs
 
-    # Use shard_map for comprehensive tensor parallelism
+    # Use shard_map for tensor parallelism
     sharded_forward = shard_map(
         model_forward,
         mesh=mesh,
@@ -383,10 +392,11 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
         key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
         attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
         
-        # Use sharded forward pass for comprehensive tensor parallelism
-        outputs = sharded_forward(params, input_ids, attention_mask, position_ids, past_key_values)
-        logits = outputs[0]
-        past_key_values = outputs[1]
+        # Use model.apply directly since ParallelDense handles tensor parallelism
+        outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
+                             position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
         
         next_token = sample_next_token(logits[:, -1, :])
         generated_tokens.append(int(next_token))
