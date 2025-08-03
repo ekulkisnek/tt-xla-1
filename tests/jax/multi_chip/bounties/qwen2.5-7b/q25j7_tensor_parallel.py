@@ -35,7 +35,7 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
 
 import jax
 import jax.numpy as jnp
