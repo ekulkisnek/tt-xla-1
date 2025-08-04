@@ -217,34 +217,43 @@ class ParallelDense(nn.Module):
                 name=self.name
             )(x)
         
-        local_shape = (in_dim, out_dim)
-
-        # Use the same parameter name structure as regular Dense layers
+        # Load full weight and let shard_map handle the sharding
+        full_shape = (in_dim, out_dim)
+        
+        # Create parameter as full weight
         kernel = self.param(
-            "kernel", nn.initializers.lecun_normal(), local_shape, self.param_dtype
+            "kernel", nn.initializers.lecun_normal(), full_shape, self.param_dtype
         )
 
-        def matmul_fn(x, k):
-            axis_idx = jax.lax.axis_index("mp")
-            # print(f"🔧 Device {axis_idx} running matmul: x.shape = {x.shape}, kernel.shape = {k.shape}")
+        def matmul_fn(x, full_kernel):
+            # Inside shard_map, each device gets a slice of the kernel
+            axis_idx = jax.lax.axis_index("mp") 
+            num_devices = jax.lax.psum(1, axis_name="mp")
+            
+            # Slice the kernel for this device
+            local_out_dim = out_dim // num_devices
+            start_idx = axis_idx * local_out_dim
+            end_idx = start_idx + local_out_dim
+            local_kernel = full_kernel[:, start_idx:end_idx]
+            
+            # Compute local output
+            local_out = jnp.einsum("bsd,df->bsf", x, local_kernel)
+            
+            # All-gather to reconstruct full output  
+            # all_gather creates (batch, seq, local_dim, num_devices)
+            gathered_out = jax.lax.all_gather(local_out, axis_name="mp", axis=-1)
+            
+            # Reshape to concatenate the feature dimensions
+            # From (batch, seq, local_dim, num_devices) to (batch, seq, full_dim)
+            batch_size, seq_len, local_dim, num_devices = gathered_out.shape
+            return jnp.reshape(gathered_out, (batch_size, seq_len, local_dim * num_devices))
 
-            local_out = jnp.einsum("bsd,df->bsf", x, k)
-
-            full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)
-
-            return jnp.reshape(
-                jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)
-            )
-
-        # Note: we replicate x, shard only kernel
+        # Replicate input and full kernel, let function handle sharding internally
         return shard_map(
             matmul_fn,
             mesh=mesh,
-            in_specs=(
-                None,
-                P(None, "mp"),
-            ),  # x is replicated, kernel is sharded on output dim
-            out_specs=P(None),  # output is sharded along output dim
+            in_specs=(P(None, None, None), P(None, None)),  # replicate both input and kernel
+            out_specs=P(None, None, None),  # replicate output
             check_rep=False,
         )(x, kernel)
 
