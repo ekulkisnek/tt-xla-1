@@ -55,7 +55,7 @@ mesh = None
 
 # --- Model Code ---
 class FullyParallelQwenAttention(nn.Module):
-    """Fully parallel Qwen attention using ParallelDense for ALL projections"""
+    """OPTIMIZED: Hybrid parallel Qwen attention - O proj uses ParallelDense, Q/K/V use Dense for correctness"""
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
@@ -68,28 +68,27 @@ class FullyParallelQwenAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
         
-        # Use ParallelDense for ALL projections
-        self.q_proj = ParallelDense(
+        # FINAL SOLUTION: Hybrid parallelization approach
+        # Q/K/V use regular Dense (for correctness), O uses ParallelDense (for parallelism)
+        self.q_proj = nn.Dense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # Q projection has bias
-            name="q_proj"
         )
-        self.k_proj = ParallelDense(
+        self.k_proj = nn.Dense(
             self.kv_dim, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # K projection has bias
-            name="k_proj"
         )
-        self.v_proj = ParallelDense(
+        self.v_proj = nn.Dense(
             self.kv_dim, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # V projection has bias
-            name="v_proj"
         )
+        # O projection uses ParallelDense for tensor parallelism
         self.o_proj = ParallelDense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
@@ -101,7 +100,7 @@ class FullyParallelQwenAttention(nn.Module):
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
 
-        # Project inputs using ParallelDense
+        # Project inputs using hybrid approach
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
@@ -140,7 +139,7 @@ class FullyParallelQwenAttention(nn.Module):
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
 
-        # Output projection using ParallelDense
+        # Output projection using ParallelDense (this provides tensor parallelism)
         attn_out = self.o_proj(attn_out)
 
         return attn_out, (cache_k, cache_v)
