@@ -40,6 +40,22 @@ logger = logging.getLogger("qwen25_nnx_tensor_parallel")
 mesh = None
 
 # --- NNX Model Code ---
+class QwenNNXRMSNorm(nnx.Module):
+    """Root Mean Square Layer Normalization for Qwen2.5 with NNX."""
+    
+    def __init__(self, config: Dict[str, Any], dtype: jnp.dtype):
+        super().__init__()
+        self.epsilon = config.get("rms_norm_eps", 1e-6)
+        self.weight = nnx.Param(jnp.ones(config["hidden_size"], dtype=dtype), sharding=P())
+
+    def __call__(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
+        hidden_states = hidden_states * jax.lax.rsqrt(variance + self.epsilon)
+        return self.weight * hidden_states.astype(input_dtype)
+
+
 class QwenNNXAttention(nnx.Module):
     """NNX-based attention with automatic tensor parallelism."""
     
@@ -188,17 +204,9 @@ class QwenNNXDecoderLayer(nnx.Module):
         self.dtype = dtype
         
         # Use NNX modules for all components
-        self.input_layernorm = nnx.RMSNorm(
-            dim=config["hidden_size"],
-            eps=config.get("rms_norm_eps", 1e-6),
-            dtype=self.dtype,
-        )
+        self.input_layernorm = QwenNNXRMSNorm(config=config, dtype=self.dtype)
         self.self_attn = QwenNNXAttention(config=config, dtype=self.dtype, rngs=rngs)
-        self.post_attention_layernorm = nnx.RMSNorm(
-            dim=config["hidden_size"],
-            eps=config.get("rms_norm_eps", 1e-6),
-            dtype=self.dtype,
-        )
+        self.post_attention_layernorm = QwenNNXRMSNorm(config=config, dtype=self.dtype)
         self.mlp = QwenNNXMLP(config=config, dtype=self.dtype, rngs=rngs)
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
@@ -234,11 +242,7 @@ class Qwen25NNXForCausalLM(nnx.Module):
             for _ in range(config["num_hidden_layers"])
         ]
         
-        self.norm = nnx.RMSNorm(
-            dim=config["hidden_size"],
-            eps=config.get("rms_norm_eps", 1e-6),
-            dtype=self.dtype,
-        )
+        self.norm = QwenNNXRMSNorm(config=config, dtype=self.dtype)
         
         # Use NNX Linear with automatic sharding for lm_head
         self.lm_head = nnx.Linear(
@@ -328,18 +332,18 @@ def make_causal_mask(q_len, k_len):
 def get_param_path(name):
     mapping = {
         "model.embed_tokens.weight": ("embed_tokens", "embedding"),
-        "model.norm.weight": ("norm", "scale"),
+        "model.norm.weight": ("norm", "weight"),
         "lm_head.weight": ("lm_head", "kernel"),
     }
     if name in mapping:
         return mapping[name]
     import re
     if m := re.match(r"model\.layers\.(\d+)\.(input|post_attention)_layernorm\.weight", name):
-        return (f"layers_{m.group(1)}", f"{m.group(2)}_layernorm", "scale")
+        return (f"layers", int(m.group(1)), f"{m.group(2)}_layernorm", "weight")
     if m := re.match(r"model\.layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.(weight|bias)", name):
-        return (f"layers_{m.group(1)}", "self_attn", f"{m.group(2)}_proj", "kernel" if m.group(3) == "weight" else "bias")
+        return (f"layers", int(m.group(1)), "self_attn", f"{m.group(2)}_proj", "kernel" if m.group(3) == "weight" else "bias")
     if m := re.match(r"model\.layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight", name):
-        return (f"layers_{m.group(1)}", "mlp", f"{m.group(2)}_proj", "kernel")
+        return (f"layers", int(m.group(1)), "mlp", f"{m.group(2)}_proj", "kernel")
     return None
 
 def transpose_if_needed(name, param):
@@ -368,7 +372,13 @@ def load_params_nnx(model, model_path, dtype):
                         # Update the state with the loaded parameter
                         d = state
                         for p in path[:-1]:
-                            d = d[p]
+                            if isinstance(p, int):
+                                # Handle list indexing for layers
+                                while len(d) <= p:
+                                    d.append({})
+                                d = d[p]
+                            else:
+                                d = d[p]
                         d[path[-1]] = param
                         
                         print(f"[Progress] Loaded: {key} -> {path}")
