@@ -55,7 +55,7 @@ mesh = None
 
 # --- Model Code ---
 class FullyParallelQwenAttention(nn.Module):
-    """OPTIMIZED: Hybrid parallel Qwen attention - O proj uses ParallelDense, Q/K/V use Dense for correctness"""
+    """FULL PARALLEL: All attention projections use ParallelDense like Llama"""
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
@@ -68,27 +68,28 @@ class FullyParallelQwenAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
         
-        # FINAL SOLUTION: Hybrid parallelization approach
-        # Q/K/V use regular Dense (for correctness), O uses ParallelDense (for parallelism)
-        self.q_proj = nn.Dense(
+        # FULL PARALLEL: All projections use ParallelDense like Llama
+        self.q_proj = ParallelDense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # Q projection has bias
+            name="q_proj"
         )
-        self.k_proj = nn.Dense(
+        self.k_proj = ParallelDense(
             self.kv_dim, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # K projection has bias
+            name="k_proj"
         )
-        self.v_proj = nn.Dense(
+        self.v_proj = ParallelDense(
             self.kv_dim, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
             use_bias=True,  # V projection has bias
+            name="v_proj"
         )
-        # O projection uses ParallelDense for tensor parallelism
         self.o_proj = ParallelDense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
@@ -100,7 +101,7 @@ class FullyParallelQwenAttention(nn.Module):
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
 
-        # Project inputs using hybrid approach
+        # Project inputs using full parallel approach
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
@@ -139,7 +140,7 @@ class FullyParallelQwenAttention(nn.Module):
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
 
-        # Output projection using ParallelDense (this provides tensor parallelism)
+        # Output projection using ParallelDense
         attn_out = self.o_proj(attn_out)
 
         return attn_out, (cache_k, cache_v)
@@ -196,10 +197,10 @@ class ParallelEmbed(nn.Module):
         return embedding[inputs.astype("i4")]
 
 class ParallelDense(nn.Module):
-    """Tensor parallel dense layer that shards weights across devices."""
+    """EXACT Llama ParallelDense implementation - no fallbacks, pure tensor parallelism."""
     features: int
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
     use_bias: bool = False
     name: str = None
 
@@ -208,48 +209,38 @@ class ParallelDense(nn.Module):
         x = x.astype(self.dtype)
         in_dim = x.shape[-1]
         out_dim = self.features
-        
-        # If we only have 1 device, fall back to regular Dense
-        if mesh is None or mesh.shape["mp"] == 1:
-            # Use regular Dense for single device
-            return nn.Dense(
-                self.features, 
-                dtype=self.dtype, 
-                param_dtype=self.param_dtype,
-                use_bias=self.use_bias,
-                name=self.name
-            )(x)
-        
-        # Use the same parameter name structure as regular Dense layers  
         local_shape = (in_dim, out_dim)  # Full output dimension like Llama
 
         kernel = self.param(
             "kernel", nn.initializers.lecun_normal(), local_shape, self.param_dtype
         )
+        
+        if self.use_bias:
+            bias = self.param('bias', nn.initializers.zeros, (self.features,), self.param_dtype)
+        else:
+            bias = None
 
         def matmul_fn(x, k):
             axis_idx = jax.lax.axis_index("mp")
-            # print(f"🔧 Device {axis_idx} running matmul: x.shape = {x.shape}, kernel.shape = {k.shape}")
-
             local_out = jnp.einsum("bsd,df->bsf", x, k)
-
-            full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)  # axis=0 like Llama
-
+            full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)
             return jnp.reshape(
-                jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)  # Llama's exact reshape
+                jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)
             )
 
         # Note: we replicate x, shard only kernel
-        return shard_map(
+        output = shard_map(
             matmul_fn,
             mesh=mesh,
-            in_specs=(
-                None,  # x is replicated
-                P(None, "mp"),  # kernel is sharded on output dim
-            ),
-            out_specs=P(None),  # output is sharded along output dim
+            in_specs=(None, P(None, "mp")),
+            out_specs=P(None),
             check_rep=False,
         )(x, kernel)
+        
+        if bias is not None:
+            output = output + bias
+            
+        return output
 
 class QwenMLP(nn.Module):
     config: Dict[str, Any]
