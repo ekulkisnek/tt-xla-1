@@ -505,16 +505,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    # Quick test with just one simple sample for incremental testing
-    print("\n=== QUICK TEST MODE ===")
-    test_sample = {"question": "What is 2 + 2?", "answer": "4"}
-    print(f"Testing with: {test_sample['question']}")
-    # Generate 5 tokens for testing tensor parallelism benefits
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 5, test_sample["question"])
+    # Test with dog food math problem
+    print("\n=== DOG FOOD MATH TEST ===")
+    dog_food_prompt = "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag, how many days will it last?"
+    print(f"Testing with: {dog_food_prompt}")
+    # Generate more tokens for a more complex response
+    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 30, dog_food_prompt)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
-    print("=== QUICK TEST COMPLETE ===")
+    print("=== DOG FOOD MATH TEST COMPLETE ===")
 
 if __name__ == "__main__":
     main() 
