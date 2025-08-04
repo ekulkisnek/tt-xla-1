@@ -68,7 +68,7 @@ class FullyParallelQwenAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
         
-        # Use ParallelDense for ALL projections like Llama
+        # Use ParallelDense for ALL projections
         self.q_proj = ParallelDense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
@@ -94,14 +94,14 @@ class FullyParallelQwenAttention(nn.Module):
             self.hidden_size, 
             dtype=jnp.bfloat16, 
             param_dtype=jnp.bfloat16, 
-            use_bias=False, 
+            use_bias=False,  # O projection has no bias
             name="o_proj"
         )
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
 
-        # Project inputs
+        # Project inputs using ParallelDense
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
@@ -134,13 +134,16 @@ class FullyParallelQwenAttention(nn.Module):
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
         if attention_mask is not None:
             scores += attention_mask
-        # Use higher precision for attention scores to reduce FP diffs
-        scores = scores.astype(jnp.float64)
-        probs = jnp.clip(jax.nn.softmax(scores.astype(jnp.float32), axis=-1), 1e-9, 1 - 1e-9)
+        
+        # Attention computation
+        probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
 
-        return self.o_proj(attn_out), (cache_k, cache_v)
+        # Output projection using ParallelDense
+        attn_out = self.o_proj(attn_out)
+
+        return attn_out, (cache_k, cache_v)
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=1000000.0):
     pos = position_ids.astype(jnp.float32)  # [batch, seq]
