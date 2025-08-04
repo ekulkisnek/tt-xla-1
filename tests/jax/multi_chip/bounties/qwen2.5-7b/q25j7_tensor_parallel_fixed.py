@@ -54,8 +54,8 @@ logger = logging.getLogger("qwen25_tensor_parallel")
 mesh = None
 
 # --- Model Code ---
-class GQAParallelAttention(nn.Module):
-    """Grouped Query Attention with tensor parallelism support"""
+class FullyParallelQwenAttention(nn.Module):
+    """Fully parallel Qwen attention using ParallelDense for ALL projections"""
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
@@ -68,29 +68,32 @@ class GQAParallelAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
         
-        # Use ParallelDense for all projections - full tensor parallelism
+        # Use ParallelDense for ALL projections like Llama
         self.q_proj = ParallelDense(
             self.hidden_size, 
-            dtype=self.dtype, 
-            param_dtype=self.dtype, 
+            dtype=jnp.bfloat16, 
+            param_dtype=jnp.bfloat16, 
+            use_bias=True,  # Q projection has bias
             name="q_proj"
         )
         self.k_proj = ParallelDense(
             self.kv_dim, 
-            dtype=self.dtype, 
-            param_dtype=self.dtype, 
+            dtype=jnp.bfloat16, 
+            param_dtype=jnp.bfloat16, 
+            use_bias=True,  # K projection has bias
             name="k_proj"
         )
         self.v_proj = ParallelDense(
             self.kv_dim, 
-            dtype=self.dtype, 
-            param_dtype=self.dtype, 
+            dtype=jnp.bfloat16, 
+            param_dtype=jnp.bfloat16, 
+            use_bias=True,  # V projection has bias
             name="v_proj"
         )
         self.o_proj = ParallelDense(
             self.hidden_size, 
-            dtype=self.dtype, 
-            param_dtype=self.dtype, 
+            dtype=jnp.bfloat16, 
+            param_dtype=jnp.bfloat16, 
             use_bias=False, 
             name="o_proj"
         )
@@ -98,7 +101,7 @@ class GQAParallelAttention(nn.Module):
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
 
-        # Project inputs using tensor parallel layers
+        # Project inputs
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
@@ -122,7 +125,7 @@ class GQAParallelAttention(nn.Module):
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
 
-        # Attention computation - this could be further optimized with sharded attention
+        # Attention computation
         q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
@@ -131,14 +134,12 @@ class GQAParallelAttention(nn.Module):
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
         if attention_mask is not None:
             scores += attention_mask
-        
         # Use higher precision for attention scores to reduce FP diffs
         scores = scores.astype(jnp.float64)
         probs = jnp.clip(jax.nn.softmax(scores.astype(jnp.float32), axis=-1), 1e-9, 1 - 1e-9)
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
 
-        # Use tensor parallel output projection
         return self.o_proj(attn_out), (cache_k, cache_v)
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=1000000.0):
@@ -217,43 +218,34 @@ class ParallelDense(nn.Module):
                 name=self.name
             )(x)
         
-        # Load full weight and let shard_map handle the sharding
-        full_shape = (in_dim, out_dim)
-        
-        # Create parameter as full weight
+        # Use the same parameter name structure as regular Dense layers  
+        local_shape = (in_dim, out_dim)  # Full output dimension like Llama
+
         kernel = self.param(
-            "kernel", nn.initializers.lecun_normal(), full_shape, self.param_dtype
+            "kernel", nn.initializers.lecun_normal(), local_shape, self.param_dtype
         )
 
-        def matmul_fn(x, full_kernel):
-            # Inside shard_map, each device gets a slice of the kernel
-            axis_idx = jax.lax.axis_index("mp") 
-            num_devices = jax.lax.psum(1, axis_name="mp")
-            
-            # Slice the kernel for this device
-            local_out_dim = out_dim // num_devices
-            start_idx = axis_idx * local_out_dim
-            end_idx = start_idx + local_out_dim
-            local_kernel = full_kernel[:, start_idx:end_idx]
-            
-            # Compute local output
-            local_out = jnp.einsum("bsd,df->bsf", x, local_kernel)
-            
-            # All-gather to reconstruct full output  
-            # all_gather creates (batch, seq, local_dim, num_devices)
-            gathered_out = jax.lax.all_gather(local_out, axis_name="mp", axis=-1)
-            
-            # Reshape to concatenate the feature dimensions
-            # From (batch, seq, local_dim, num_devices) to (batch, seq, full_dim)
-            batch_size, seq_len, local_dim, num_devices = gathered_out.shape
-            return jnp.reshape(gathered_out, (batch_size, seq_len, local_dim * num_devices))
+        def matmul_fn(x, k):
+            axis_idx = jax.lax.axis_index("mp")
+            # print(f"🔧 Device {axis_idx} running matmul: x.shape = {x.shape}, kernel.shape = {k.shape}")
 
-        # Replicate input and full kernel, let function handle sharding internally
+            local_out = jnp.einsum("bsd,df->bsf", x, k)
+
+            full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)  # axis=0 like Llama
+
+            return jnp.reshape(
+                jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)  # Llama's exact reshape
+            )
+
+        # Note: we replicate x, shard only kernel
         return shard_map(
             matmul_fn,
             mesh=mesh,
-            in_specs=(P(None, None, None), P(None, None)),  # replicate both input and kernel
-            out_specs=P(None, None, None),  # replicate output
+            in_specs=(
+                None,  # x is replicated
+                P(None, "mp"),  # kernel is sharded on output dim
+            ),
+            out_specs=P(None),  # output is sharded along output dim
             check_rep=False,
         )(x, kernel)
 
@@ -294,7 +286,7 @@ class QwenDecoderLayer(nn.Module):
     def setup(self):
         c = self.config
         self.input_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="input_layernorm")
-        self.self_attn = GQAParallelAttention(config=c, dtype=jnp.bfloat16)
+        self.self_attn = FullyParallelQwenAttention(config=c, dtype=jnp.bfloat16)
         self.post_attention_layernorm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="post_attention_layernorm")
         self.mlp = QwenMLP(config=c, dtype=jnp.bfloat16)
 
