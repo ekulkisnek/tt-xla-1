@@ -87,6 +87,31 @@ def apply_rotary_emb_complex(q, k, freqs_cis):
     return q_rot_real.astype(q.dtype), k_rot_real.astype(k.dtype)
 
 # --- Model Code ---
+class FlaxQwenPreTrainedModel(nn.Module):
+    """Base class for Qwen pretrained models with standard initialization."""
+    
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: Dict = None) -> Dict:
+        """Initialize model weights."""
+        # Initialize the model
+        init_rngs = {"params": rng}
+        if params is None:
+            params = self.init(init_rngs, jnp.ones(input_shape), return_dict=True)["params"]
+        return params
+    
+    def init_cache(self, batch_size: int, max_length: int) -> Dict:
+        """Initialize cache for generation."""
+        # Initialize cache variables
+        cache = {}
+        for layer_idx in range(self.config["num_hidden_layers"]):
+            cache[f"layers_{layer_idx}"] = {
+                "self_attn": {
+                    "cached_key": jnp.zeros((batch_size, max_length, self.config.get("num_key_value_heads", self.config["num_attention_heads"]), self.config["hidden_size"] // self.config["num_attention_heads"]), dtype=jnp.bfloat16),
+                    "cached_value": jnp.zeros((batch_size, max_length, self.config.get("num_key_value_heads", self.config["num_attention_heads"]), self.config["hidden_size"] // self.config["num_attention_heads"]), dtype=jnp.bfloat16),
+                    "cache_index": jnp.array(0, dtype=jnp.int32)
+                }
+            }
+        return cache
+
 class FullyParallelQwenAttention(nn.Module):
     """Full parallel attention with all projections using ParallelDense."""
     config: Dict[str, Any]
@@ -225,8 +250,8 @@ def make_causal_mask(q_len, k_len):
     j = jnp.arange(k_len)[None, :]
     return jnp.where(i >= j - (k_len - q_len), 0, -1e9)
 
-class ParallelEmbed(nn.Module):
-    """Tensor parallel embedding layer that shards embeddings across vocab dimension"""
+class StandardEmbed(nn.Module):
+    """Embeddings replicated across devices for TP efficiency."""
     num_embeddings: int
     features: int
     dtype: jnp.dtype = jnp.float32
@@ -359,13 +384,13 @@ class QwenDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(hidden_states)
         return hidden_states, past_key_value
 
-class Qwen25ForCausalLM(nn.Module):
+class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         c = self.config
-        self.embed_tokens = ParallelEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
+        self.embed_tokens = StandardEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
         # Use standard nn.Dense for LM head (non-parallelized for efficiency)
@@ -402,6 +427,18 @@ class Qwen25ForCausalLM(nn.Module):
         if return_dict:
             return {"logits": logits, "past_key_values": new_key_values}
         return logits
+
+class FlaxQwenForCausalLM(FlaxQwenPreTrainedModel):
+    """Qwen model for causal language modeling with tensor parallelism."""
+    config: Dict[str, Any]
+    dtype: jnp.dtype = jnp.float32
+    module_class = Qwen25ForCausalLM
+    
+    def setup(self):
+        self.module = self.module_class(config=self.config, dtype=self.dtype)
+    
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 # --- Weight Loading ---
 def get_param_path(name):

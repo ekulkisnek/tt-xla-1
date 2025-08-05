@@ -225,8 +225,8 @@ def make_causal_mask(q_len, k_len):
     j = jnp.arange(k_len)[None, :]
     return jnp.where(i >= j - (k_len - q_len), 0, -1e9)
 
-class ParallelEmbed(nn.Module):
-    """Tensor parallel embedding layer that shards embeddings across vocab dimension"""
+class StandardEmbed(nn.Module):
+    """Embeddings replicated across devices for TP efficiency."""
     num_embeddings: int
     features: int
     dtype: jnp.dtype = jnp.float32
@@ -365,7 +365,7 @@ class Qwen25ForCausalLM(nn.Module):
 
     def setup(self):
         c = self.config
-        self.embed_tokens = ParallelEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
+        self.embed_tokens = StandardEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
         # Use standard nn.Dense for LM head (non-parallelized for efficiency)
