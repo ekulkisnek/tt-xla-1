@@ -17,6 +17,8 @@ Self-contained Qwen2.5-7B-Instruct inference script for multi-device JAX with te
 - Enhanced memory management with GC collects.
 - TENSOR PARALLELISM: Multi-device distributed inference using shard_map.
 
+Test
+
 Usage:
 python q25j7_tensor_parallel_fixed.py --model_path weights
 """
