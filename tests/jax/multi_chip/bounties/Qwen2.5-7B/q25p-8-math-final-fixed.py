@@ -166,13 +166,7 @@ class FullyParallelQwenAttention(nn.Module):
             name="o_proj"
         )
         
-        # Initialize mutable cache variables
-        self.cached_key = self.variable("cache", "cached_key", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cached_value = self.variable("cache", "cached_value", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-        
-        # Precompute RoPE frequencies
-        self.freqs_cis = precompute_freqs_cis(self.head_dim, c["max_position_embeddings"], self.rope_theta)
+        # No mutable cache - use explicit past_key_values for simplicity and reliability
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
@@ -182,45 +176,29 @@ class FullyParallelQwenAttention(nn.Module):
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
 
-        # Apply rotary embeddings using precomputed frequencies
+        # Apply rotary embeddings using cos/sin method (like working version)
         if position_ids is not None:
-            freqs_cis = self.freqs_cis[position_ids]
-            q, k = apply_rotary_emb_complex(q, k, freqs_cis)
+            cos, sin = compute_cos_sin_cache(position_ids, self.head_dim, self.rope_theta)
+            q, k = apply_rotary_emb(q, k, cos, sin)
 
-        # Handle KV cache with mutable in-place updates
-        cur_index = self.cache_index.value
+        # Handle KV cache with simple explicit approach
         if past_key_value is not None:
             past_k, past_v = past_key_value
-        else:
-            # First step: use zeros up to cur_index (which is 0)
-            past_k = self.cached_key.value[:, :cur_index, :, :]
-            past_v = self.cached_value.value[:, :cur_index, :, :]
+            k = jnp.concatenate([past_k, k], axis=1)
+            v = jnp.concatenate([past_v, v], axis=1)
 
-        # Concatenate only for computation, but update cache in-place
-        k_full = jnp.concatenate([past_k, k], axis=1)
-        v_full = jnp.concatenate([past_v, v], axis=1)
-
-        # In-place update the new slice in cache
-        self.cached_key.value = self.cached_key.value.at[:, cur_index:cur_index + seq, :, :].set(k.astype(self.dtype))
-        self.cached_value.value = self.cached_value.value.at[:, cur_index:cur_index + seq, :, :].set(v.astype(self.dtype))
-        self.cache_index.value += seq
-
-        # Use the full updated KV for attention
-        cache_k, cache_v = k_full, v_full  # Or slice from cache: self.cached_key.value[:, :cur_index + seq, :, :]
+        cache_k, cache_v = k, v
 
         # GQA: Repeat k/v to match query heads
         if self.num_heads != self.num_kv_heads:
             repeat = self.num_heads // self.num_kv_heads
-            k_full = jnp.repeat(k_full, repeat, axis=2)
-            v_full = jnp.repeat(v_full, repeat, axis=2)
-        else:
-            k_full = k_full
-            v_full = v_full
+            k = jnp.repeat(k, repeat, axis=2)
+            v = jnp.repeat(v, repeat, axis=2)
 
         # Attention computation
         q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
-        k = k_full.transpose(0, 2, 1, 3)
-        v = v_full.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
         scale = 1.0 / jnp.sqrt(self.head_dim)
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
@@ -408,8 +386,8 @@ class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
         self.embed_tokens = StandardEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
-        # Use standard nn.Dense for LM head (non-parallelized for efficiency)
-        self.lm_head = nn.Dense(
+        # Use ParallelDense for LM head to fix tensor parallelism issues
+        self.lm_head = ParallelDense(
             c["vocab_size"],
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
@@ -604,17 +582,15 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
                 position_ids=position_ids
             )
             
-            # Run model inference
-            outputs, mutable_vars = model.apply(
+            # Run model inference (no mutable cache needed)
+            outputs = model.apply(
                 params, 
                 **model_inputs, 
-                return_dict=True, 
-                mutable=["cache"]
+                return_dict=True
             )
             
-            # Update past_key_values from outputs (which uses returned cache_k, cache_v)
+            # Update past_key_values from outputs
             past_key_values = outputs["past_key_values"]
-            # If needed, mutable_vars contains updated 'cache' dict per layer— but since __call__ returns new_kv, it's synced
             
             # Get logits
             logits = outputs["logits"]

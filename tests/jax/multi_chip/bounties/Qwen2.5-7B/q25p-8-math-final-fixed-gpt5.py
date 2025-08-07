@@ -244,16 +244,21 @@ class FullyParallelQwenAttention(nn.Module):
             k_for_attn = jnp.repeat(k_for_attn, repeat, axis=2)
             v_for_attn = jnp.repeat(v_for_attn, repeat, axis=2)
 
-        q = q.transpose(0, 2, 1, 3)
-        k_t = k_for_attn.transpose(0, 2, 1, 3)
-        v_t = v_for_attn.transpose(0, 2, 1, 3)
+        # Compute attention in float32 for numerical stability
+        q_f32 = q.astype(jnp.float32)
+        k_f32 = k_for_attn.astype(jnp.float32)
+        v_f32 = v_for_attn.astype(jnp.float32)
+
+        q_f32 = q_f32.transpose(0, 2, 1, 3)
+        k_f32 = k_f32.transpose(0, 2, 1, 3)
+        v_f32 = v_f32.transpose(0, 2, 1, 3)
 
         scale = 1.0 / jnp.sqrt(self.head_dim)
-        scores = jnp.einsum('bhqd,bhkd->bhqk', q, k_t) * scale
+        scores = jnp.einsum('bhqd,bhkd->bhqk', q_f32, k_f32) * scale
         if attention_mask is not None:
             scores = scores + attention_mask
-        probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
-        attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v_t)
+        probs = jax.nn.softmax(scores, axis=-1)
+        attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v_f32)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
         attn_out = self.o_proj(attn_out)
         return attn_out, (cache_k, cache_v)
@@ -482,10 +487,10 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference (gpt5 variant)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
-    parser.add_argument("--rope", type=str, default="cos_sin", choices=["cos_sin", "complex"], help="RoPE implementation")
-    parser.add_argument("--lm_head", type=str, default="parallel", choices=["parallel", "dense"], help="LM head implementation")
-    parser.add_argument("--cache_mode", type=str, default="pkv", choices=["pkv", "mutable"], help="KV cache strategy")
-    parser.add_argument("--embed", type=str, default="parallel", choices=["parallel", "standard"], help="Embedding implementation")
+    parser.add_argument("--rope", type=str, default="complex", choices=["cos_sin", "complex"], help="RoPE implementation")
+    parser.add_argument("--lm_head", type=str, default="dense", choices=["parallel", "dense"], help="LM head implementation")
+    parser.add_argument("--cache_mode", type=str, default="mutable", choices=["pkv", "mutable"], help="KV cache strategy")
+    parser.add_argument("--embed", type=str, default="standard", choices=["parallel", "standard"], help="Embedding implementation")
     parser.add_argument("--tokens", type=int, default=500, help="Max generation tokens")
     parser.add_argument("--prompt", type=str, default="Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?", help="Prompt to generate for")
     args = parser.parse_args()
