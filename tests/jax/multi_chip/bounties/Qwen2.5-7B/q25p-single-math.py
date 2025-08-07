@@ -36,7 +36,7 @@ from typing import Dict, Any, Optional, Tuple
 # Disable x64 globally for faster inference
 os.environ["JAX_ENABLE_X64"] = "0"
 
-# Set up multi-device (do this before importing jax)
+# Set up single device (do this before importing jax)
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
 
 import jax
@@ -686,13 +686,13 @@ def main():
     print("Testing Qwen2.5-7B on math problems...")
     print("=" * 80)
     
-    for i, question in enumerate(reversed(math_questions[1:]), 2):  # Start from index 1 (question 2) in reverse order
+    for i, question in enumerate(math_questions, 1):
         print(f"\nQuestion {i}:")
         print(f"Prompt: {question}")
         print("-" * 60)
         
-        # Generate with 325 max tokens to allow full reasoning
-        output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 325, question)
+        # Generate with 500 max tokens to allow full reasoning
+        output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 500, question)
         print(f"Output: {output}")
         print(f"Peak memory: {peak_mem:.2f} GB")
         print(f"Avg time per token: {avg_time_per_token:.4f} seconds")

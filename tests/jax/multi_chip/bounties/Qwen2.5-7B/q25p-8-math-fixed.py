@@ -102,13 +102,14 @@ class FlaxQwenPreTrainedModel(nn.Module):
     
     def init_cache(self, batch_size: int, max_length: int) -> Dict:
         """Initialize cache for generation."""
-        # Initialize cache variables
         cache = {}
+        num_kv_heads = self.config.get("num_key_value_heads", self.config["num_attention_heads"])
+        head_dim = self.config["hidden_size"] // self.config["num_attention_heads"]
         for layer_idx in range(self.config["num_hidden_layers"]):
             cache[f"layers_{layer_idx}"] = {
                 "self_attn": {
-                    "cached_key": jnp.zeros((batch_size, max_length, self.config.get("num_key_value_heads", self.config["num_attention_heads"]), self.config["hidden_size"] // self.config["num_attention_heads"]), dtype=jnp.bfloat16),
-                    "cached_value": jnp.zeros((batch_size, max_length, self.config.get("num_key_value_heads", self.config["num_attention_heads"]), self.config["hidden_size"] // self.config["num_attention_heads"]), dtype=jnp.bfloat16),
+                    "cached_key": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
+                    "cached_value": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
                     "cache_index": jnp.array(0, dtype=jnp.int32)
                 }
             }
@@ -562,6 +563,10 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
     attention_mask = None
     position_ids = None
     
+    # Initialize cache
+    max_length = model.config.get("max_position_embeddings", 2048)  # From model config
+    cache = model.init_cache(batch_size=1, max_length=max_length)  # Assuming batch=1; make dynamic if needed
+    
     num_tokens_generated = 0
     print(f"Entering generation loop for {max_tokens} tokens...")
     print("Generating tokens (this may take a while on CPU)...")
@@ -686,17 +691,18 @@ def main():
     print("Testing Qwen2.5-7B on math problems...")
     print("=" * 80)
     
-    for i, question in enumerate(reversed(math_questions[1:]), 2):  # Start from index 1 (question 2) in reverse order
-        print(f"\nQuestion {i}:")
-        print(f"Prompt: {question}")
-        print("-" * 60)
-        
-        # Generate with 325 max tokens to allow full reasoning
-        output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 325, question)
-        print(f"Output: {output}")
-        print(f"Peak memory: {peak_mem:.2f} GB")
-        print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
-        print("=" * 80)
+    # Only run Sam's test scores question (last question, index 9)
+    question = math_questions[9]  # Index 9 is Sam's test scores
+    print(f"\nQuestion 10 (Sam's test scores):")
+    print(f"Prompt: {question}")
+    print("-" * 60)
+    
+    # Generate with 325 max tokens to allow full reasoning
+    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 325, question)
+    print(f"Output: {output}")
+    print(f"Peak memory: {peak_mem:.2f} GB")
+    print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
+    print("=" * 80)
 
 if __name__ == "__main__":
     main() 
