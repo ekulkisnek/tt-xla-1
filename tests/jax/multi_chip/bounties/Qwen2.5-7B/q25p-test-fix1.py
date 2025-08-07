@@ -166,11 +166,6 @@ class FullyParallelQwenAttention(nn.Module):
             name="o_proj"
         )
         
-        # Initialize mutable cache variables
-        self.cached_key = self.variable("cache", "cached_key", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cached_value = self.variable("cache", "cached_value", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-        
         # Precompute RoPE frequencies
         self.freqs_cis = precompute_freqs_cis(self.head_dim, c["max_position_embeddings"], self.rope_theta)
 
@@ -187,35 +182,27 @@ class FullyParallelQwenAttention(nn.Module):
             freqs_cis = self.freqs_cis[position_ids]
             q, k = apply_rotary_emb_complex(q, k, freqs_cis)
 
-        # Handle KV cache with mutable in-place updates
-        cur_index = self.cache_index.value
+        # Handle KV cache with proper management
         if past_key_value is not None:
             past_k, past_v = past_key_value
+            # GQA: Repeat current k/v to match query heads before concatenation
+            if self.num_heads != self.num_kv_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k = jnp.repeat(k, repeat, axis=2)
+                v = jnp.repeat(v, repeat, axis=2)
+            # Concatenate with past cache
+            k_full = jnp.concatenate([past_k, k], axis=1)
+            v_full = jnp.concatenate([past_v, v], axis=1)
         else:
-            # First step: use zeros up to cur_index (which is 0)
-            past_k = self.cached_key.value[:, :cur_index, :, :]
-            past_v = self.cached_value.value[:, :cur_index, :, :]
-
-        # Concatenate only for computation, but update cache in-place
-        k_full = jnp.concatenate([past_k, k], axis=1)
-        v_full = jnp.concatenate([past_v, v], axis=1)
-
-        # In-place update the new slice in cache
-        self.cached_key.value = self.cached_key.value.at[:, cur_index:cur_index + seq, :, :].set(k.astype(self.dtype))
-        self.cached_value.value = self.cached_value.value.at[:, cur_index:cur_index + seq, :, :].set(v.astype(self.dtype))
-        self.cache_index.value += seq
-
-        # Use the full updated KV for attention
-        cache_k, cache_v = k_full, v_full  # Or slice from cache: self.cached_key.value[:, :cur_index + seq, :, :]
-
-        # GQA: Repeat k/v to match query heads
-        if self.num_heads != self.num_kv_heads:
-            repeat = self.num_heads // self.num_kv_heads
-            k_full = jnp.repeat(k_full, repeat, axis=2)
-            v_full = jnp.repeat(v_full, repeat, axis=2)
-        else:
-            k_full = k_full
-            v_full = v_full
+            # First step: use current k, v only
+            # GQA: Repeat k/v to match query heads
+            if self.num_heads != self.num_kv_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k_full = jnp.repeat(k, repeat, axis=2)
+                v_full = jnp.repeat(v, repeat, axis=2)
+            else:
+                k_full = k
+                v_full = v
 
         # Attention computation
         q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
@@ -235,7 +222,7 @@ class FullyParallelQwenAttention(nn.Module):
         # Output projection using ParallelDense
         attn_out = self.o_proj(attn_out)
 
-        return attn_out, (cache_k, cache_v)
+        return attn_out, (k_full, v_full)
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=1000000.0):
     pos = position_ids.astype(jnp.float32)  # [batch, seq]
@@ -581,13 +568,6 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     attention_mask = None
     position_ids = None
     
-    # Initialize cache
-    max_length = model.config.get("max_position_embeddings", 2048)  # From model config
-    cache = model.init_cache(batch_size=batch_size, max_length=max_length)  # Use batch_size parameter
-    
-    # Reset cache for new generation (ensure clean state)
-    # The cache will be properly initialized when the model is first called
-    
     num_tokens_generated = 0
     print(f"Entering generation loop for {max_tokens} tokens...")
     print("Generating tokens (this may take a while on CPU)...")
@@ -605,16 +585,14 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
             )
             
             # Run model inference
-            outputs, mutable_vars = model.apply(
+            outputs = model.apply(
                 params, 
                 **model_inputs, 
-                return_dict=True, 
-                mutable=["cache"]
+                return_dict=True
             )
             
-            # Update past_key_values from outputs (which uses returned cache_k, cache_v)
+            # Update past_key_values from outputs
             past_key_values = outputs["past_key_values"]
-            # If needed, mutable_vars contains updated 'cache' dict per layer— but since __call__ returns new_kv, it's synced
             
             # Get logits
             logits = outputs["logits"]
@@ -624,7 +602,6 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
             print(f"Current token index: {i+1}")
             if past_key_values and past_key_values[0]:
                 print(f"Cache length: {past_key_values[0][0].shape[1] if past_key_values[0][0] is not None else 0}")
-            print(f"Max sequence length: {max_length}")
             raise e
         
         # Sample next token

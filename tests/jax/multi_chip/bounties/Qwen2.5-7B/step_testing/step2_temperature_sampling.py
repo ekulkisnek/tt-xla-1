@@ -37,7 +37,7 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 import jax
 import jax.numpy as jnp
@@ -55,72 +55,7 @@ logger = logging.getLogger("qwen25_tensor_parallel")
 # Global mesh for tensor parallelism
 mesh = None
 
-# --- Precomputed RoPE ---
-def precompute_freqs_cis(dim: int, end: int, theta: float = 1000000.0):
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(end, dtype=jnp.float32)
-    freqs = jnp.outer(t, freqs).astype(jnp.float32)
-    return jnp.exp(1j * freqs)  # Complex for efficient application
-
-def apply_rotary_emb_complex(q, k, freqs_cis):
-    # q, k: [batch, seq, heads, head_dim]
-    # freqs_cis: [batch, seq, dim//2] (complex)
-    
-    half_dim = q.shape[-1] // 2
-    
-    # Split q and k into first and second half
-    q1, q2 = q[..., :half_dim], q[..., half_dim:]
-    k1, k2 = k[..., :half_dim], k[..., half_dim:]
-    
-    # Convert to complex and apply rotation (cast to float32 for complex operations)
-    q_complex = jax.lax.complex(q1.astype(jnp.float32), q2.astype(jnp.float32))
-    k_complex = jax.lax.complex(k1.astype(jnp.float32), k2.astype(jnp.float32))
-    
-    # Apply rotation using complex multiplication
-    # freqs_cis: [batch, seq, dim//2] -> [batch, seq, 1, dim//2] for broadcasting
-    freqs_cis_expanded = freqs_cis[..., None, :]
-    q_rot = q_complex * freqs_cis_expanded
-    k_rot = k_complex * freqs_cis_expanded
-    
-    # Convert back to real format
-    q_rot_real = jnp.concatenate([jnp.real(q_rot), jnp.imag(q_rot)], axis=-1)
-    k_rot_real = jnp.concatenate([jnp.real(k_rot), jnp.imag(k_rot)], axis=-1)
-    
-    return q_rot_real.astype(q.dtype), k_rot_real.astype(k.dtype)
-
 # --- Model Code ---
-class FlaxQwenPreTrainedModel(nn.Module):
-    """Base class for Qwen pretrained models with standard initialization."""
-    
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: Dict = None) -> Dict:
-        """Initialize model weights."""
-        # Initialize the model
-        init_rngs = {"params": rng}
-        if params is None:
-            params = self.init(init_rngs, jnp.ones(input_shape), return_dict=True)["params"]
-        return params
-    
-    def init_cache(self, batch_size: int, max_length: int) -> Dict:
-        """Initialize cache for generation."""
-        cache = {}
-        num_kv_heads = self.config.get("num_key_value_heads", self.config["num_attention_heads"])
-        head_dim = self.config["hidden_size"] // self.config["num_attention_heads"]
-        for layer_idx in range(self.config["num_hidden_layers"]):
-            cache[f"layers_{layer_idx}"] = {
-                "self_attn": {
-                    "cached_key": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
-                    "cached_value": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
-                    "cache_index": jnp.array(0, dtype=jnp.int32)
-                }
-            }
-        return cache
-    
-    def reset_cache(self):
-        """Reset cache for new generation."""
-        # This would be called before starting a new generation
-        # In practice, we'll handle this in the generation loop
-        pass
-
 class FullyParallelQwenAttention(nn.Module):
     """Full parallel attention with all projections using ParallelDense."""
     config: Dict[str, Any]
@@ -134,7 +69,6 @@ class FullyParallelQwenAttention(nn.Module):
         self.num_kv_heads = c.get("num_key_value_heads", self.num_heads)
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
-        self.max_seq_len = c.get("max_position_embeddings", 2048)
         
         # All projections use ParallelDense for full tensor parallelism
         self.q_proj = ParallelDense(
@@ -165,14 +99,6 @@ class FullyParallelQwenAttention(nn.Module):
             use_bias=False,
             name="o_proj"
         )
-        
-        # Initialize mutable cache variables
-        self.cached_key = self.variable("cache", "cached_key", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cached_value = self.variable("cache", "cached_value", jnp.zeros, (1, self.max_seq_len, self.num_kv_heads, self.head_dim), self.dtype)
-        self.cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
-        
-        # Precompute RoPE frequencies
-        self.freqs_cis = precompute_freqs_cis(self.head_dim, c["max_position_embeddings"], self.rope_theta)
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
@@ -182,45 +108,29 @@ class FullyParallelQwenAttention(nn.Module):
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
 
-        # Apply rotary embeddings using precomputed frequencies
+        # Apply rotary embeddings
         if position_ids is not None:
-            freqs_cis = self.freqs_cis[position_ids]
-            q, k = apply_rotary_emb_complex(q, k, freqs_cis)
+            cos, sin = compute_cos_sin_cache(position_ids, self.head_dim, self.rope_theta)
+            q, k = apply_rotary_emb(q, k, cos, sin)
 
-        # Handle KV cache with mutable in-place updates
-        cur_index = self.cache_index.value
+        # Handle KV cache
         if past_key_value is not None:
             past_k, past_v = past_key_value
-        else:
-            # First step: use zeros up to cur_index (which is 0)
-            past_k = self.cached_key.value[:, :cur_index, :, :]
-            past_v = self.cached_value.value[:, :cur_index, :, :]
+            k = jnp.concatenate([past_k, k], axis=1)
+            v = jnp.concatenate([past_v, v], axis=1)
 
-        # Concatenate only for computation, but update cache in-place
-        k_full = jnp.concatenate([past_k, k], axis=1)
-        v_full = jnp.concatenate([past_v, v], axis=1)
-
-        # In-place update the new slice in cache
-        self.cached_key.value = self.cached_key.value.at[:, cur_index:cur_index + seq, :, :].set(k.astype(self.dtype))
-        self.cached_value.value = self.cached_value.value.at[:, cur_index:cur_index + seq, :, :].set(v.astype(self.dtype))
-        self.cache_index.value += seq
-
-        # Use the full updated KV for attention
-        cache_k, cache_v = k_full, v_full  # Or slice from cache: self.cached_key.value[:, :cur_index + seq, :, :]
+        cache_k, cache_v = k, v
 
         # GQA: Repeat k/v to match query heads
         if self.num_heads != self.num_kv_heads:
             repeat = self.num_heads // self.num_kv_heads
-            k_full = jnp.repeat(k_full, repeat, axis=2)
-            v_full = jnp.repeat(v_full, repeat, axis=2)
-        else:
-            k_full = k_full
-            v_full = v_full
+            k = jnp.repeat(k, repeat, axis=2)
+            v = jnp.repeat(v, repeat, axis=2)
 
         # Attention computation
         q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
-        k = k_full.transpose(0, 2, 1, 3)
-        v = v_full.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
         scale = 1.0 / jnp.sqrt(self.head_dim)
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
@@ -265,8 +175,8 @@ def make_causal_mask(q_len, k_len):
     j = jnp.arange(k_len)[None, :]
     return jnp.where(i >= j - (k_len - q_len), 0, -1e9)
 
-class StandardEmbed(nn.Module):
-    """Embeddings replicated across devices for TP efficiency."""
+class ParallelEmbed(nn.Module):
+    """Tensor parallel embedding layer that shards embeddings across vocab dimension"""
     num_embeddings: int
     features: int
     dtype: jnp.dtype = jnp.float32
@@ -399,23 +309,17 @@ class QwenDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(hidden_states)
         return hidden_states, past_key_value
 
-class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
+class Qwen25ForCausalLM(nn.Module):
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         c = self.config
-        self.embed_tokens = StandardEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
+        self.embed_tokens = ParallelEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
-        # Use standard nn.Dense for LM head (non-parallelized for efficiency)
-        self.lm_head = nn.Dense(
-            c["vocab_size"],
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-            use_bias=False,  # Align with standard; no bias in LM head
-            name="lm_head"
-        )
+        # Use ParallelDense for tensor parallelism
+        self.lm_head = ParallelDense(c["vocab_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="lm_head")
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
         batch, seq = input_ids.shape
@@ -442,59 +346,6 @@ class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
         if return_dict:
             return {"logits": logits, "past_key_values": new_key_values}
         return logits
-    
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        """Prepare inputs for generation step."""
-        batch, seq = input_ids.shape
-        
-        # Generate position IDs if not provided
-        position_ids = kwargs.get("position_ids", None)
-        if position_ids is None:
-            if past_key_values is None or past_key_values[0] is None:
-                # First generation step
-                position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
-            else:
-                # Subsequent steps - continue from where we left off
-                position_ids = jnp.array([[past_key_values[0][0].shape[1]]], dtype=jnp.int32)
-        
-        # Create attention mask with proper shape for current sequence
-        if attention_mask is None:
-            key_len = seq if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + seq
-            attention_mask = jnp.ones((batch, 1, seq, key_len), dtype=jnp.float32)
-        
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-        }
-    
-    def update_inputs_for_generation(self, model_outputs, **kwargs):
-        """Update inputs for next generation step."""
-        # Update position_ids for next step
-        current_position_ids = kwargs.get("position_ids", None)
-        if current_position_ids is not None:
-            # Increment position_ids for next token
-            next_position_ids = current_position_ids[:, -1:] + 1
-        else:
-            next_position_ids = None
-        
-        return {
-            "past_key_values": model_outputs["past_key_values"],
-            "position_ids": next_position_ids,
-        }
-
-class FlaxQwenForCausalLM(FlaxQwenPreTrainedModel):
-    """Qwen model for causal language modeling with tensor parallelism."""
-    config: Dict[str, Any]
-    dtype: jnp.dtype = jnp.float32
-    module_class = Qwen25ForCausalLM
-    
-    def setup(self):
-        self.module = self.module_class(config=self.config, dtype=self.dtype)
-    
-    def __call__(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
 
 # --- Weight Loading ---
 def get_param_path(name):
@@ -543,18 +394,28 @@ def load_params(model, model_path, dtype):
     return params
 
 # --- Generation ---
-def sample_next_token(logits):
-    """Simplified greedy sampling only."""
-    # Add some debugging to see what's happening
-    next_token = int(jnp.argmax(logits, axis=-1)[0])
+def sample_next_token(logits, temperature=0.7, top_k=50):
+    """Sample with temperature and top-k to reduce repetition."""
+    # Apply temperature
+    logits = logits / temperature
     
-    # Check for repetition - if the same token is being selected repeatedly
-    # This could indicate an issue with the model output or sampling
+    # Apply top-k filtering
+    if top_k > 0:
+        top_k_logits, top_k_indices = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
+        # Create a mask for top-k values
+        mask = jnp.zeros_like(logits, dtype=jnp.bool)
+        mask = mask.at[..., top_k_indices].set(True)
+        # Set non-top-k values to very negative infinity
+        logits = jnp.where(mask, logits, -1e9)
     
-    return next_token
+    # Convert to probabilities
+    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
+    
+    # Sample from the distribution
+    sampled_token = jax.random.categorical(jax.random.PRNGKey(0), probs)
+    return int(sampled_token[0])
 
-def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
-    """Standard generation using model's prepare_inputs_for_generation and update_inputs_for_generation methods."""
+def generate_text(model, params, tokenizer, max_tokens, prompt):
     print("Starting text generation...")
     
     # Monitor memory usage
@@ -563,7 +424,7 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     print(f"Initial memory before generation: {initial_memory:.2f} GB used")
     print(f"Free memory: {psutil.virtual_memory().available / 1024**3:.2f} GB")
     
-    # Tokenize input with chat template formatting
+    # Tokenize input with chat template
     messages = [
         {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
         {"role": "user", "content": prompt}
@@ -571,83 +432,37 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     input_ids = tokenizer.encode(formatted_text, return_tensors="jax")
     batch, seq = input_ids.shape
+    position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
+    past_key_values = None
     
     generated_tokens = []
     start_time = time.time()
     peak_memory = initial_memory
     
-    # Initialize generation state
-    past_key_values = None
-    attention_mask = None
-    position_ids = None
-    
-    # Initialize cache
-    max_length = model.config.get("max_position_embeddings", 2048)  # From model config
-    cache = model.init_cache(batch_size=batch_size, max_length=max_length)  # Use batch_size parameter
-    
-    # Reset cache for new generation (ensure clean state)
-    # The cache will be properly initialized when the model is first called
-    
+    # Simplified generation - use model.apply directly
+    # The ParallelDense layers handle tensor parallelism internally
+
     num_tokens_generated = 0
     print(f"Entering generation loop for {max_tokens} tokens...")
     print("Generating tokens (this may take a while on CPU)...")
     
     for i in range(max_tokens):
         print(f"Generating token {i+1}/{max_tokens}...", end="", flush=True)
+        # Create attention mask with proper shape for current sequence
+        current_seq_len = input_ids.shape[1]
+        key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
+        attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
         
-        try:
-            # Use model's prepare_inputs_for_generation method
-            model_inputs = model.prepare_inputs_for_generation(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                position_ids=position_ids
-            )
-            
-            # Run model inference
-            outputs, mutable_vars = model.apply(
-                params, 
-                **model_inputs, 
-                return_dict=True, 
-                mutable=["cache"]
-            )
-            
-            # Update past_key_values from outputs (which uses returned cache_k, cache_v)
-            past_key_values = outputs["past_key_values"]
-            # If needed, mutable_vars contains updated 'cache' dict per layer— but since __call__ returns new_kv, it's synced
-            
-            # Get logits
-            logits = outputs["logits"]
-            
-        except Exception as e:
-            print(f"\nError during generation: {e}")
-            print(f"Current token index: {i+1}")
-            if past_key_values and past_key_values[0]:
-                print(f"Cache length: {past_key_values[0][0].shape[1] if past_key_values[0][0] is not None else 0}")
-            print(f"Max sequence length: {max_length}")
-            raise e
+        # Use model.apply directly since ParallelDense handles tensor parallelism
+        outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
+                             position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
         
-        # Sample next token
         next_token = sample_next_token(logits[:, -1, :])
         generated_tokens.append(int(next_token))
-        
-        # Debug: Check for repetition
-        if len(generated_tokens) > 1 and generated_tokens[-1] == generated_tokens[-2]:
-            print(f"\nWARNING: Token repetition detected! Token {generated_tokens[-1]} repeated")
-            print(f"Previous tokens: {generated_tokens[-5:] if len(generated_tokens) >= 5 else generated_tokens}")
-        
-        # Update inputs for next iteration using model's update_inputs_for_generation
-        update_inputs = model.update_inputs_for_generation(outputs, position_ids=model_inputs["position_ids"])
-        past_key_values = update_inputs["past_key_values"]
-        position_ids = update_inputs["position_ids"]
-        
-        # Update input_ids for next step
         input_ids = jnp.array([[next_token]])
-        
-        # Debug: Print the current input_ids shape and content
-        if i < 5:  # Only print first few iterations to avoid spam
-            print(f"  Debug: input_ids shape: {input_ids.shape}, content: {input_ids}")
-        
+        position_ids = position_ids[:, -1:] + 1
         num_tokens_generated += 1
         
         # Update peak mem
@@ -675,10 +490,6 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     
     full_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     print("Generation complete.")
-    
-    # Clean up memory
-    gc.collect()
-    
     return full_output, peak_memory, avg_time_per_token
 
 
@@ -704,7 +515,7 @@ def setup_device_mesh():
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference for GSM8K Benchmark")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference for Sam's Test Scores Question")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     args = parser.parse_args()
@@ -720,41 +531,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    # Math questions to test
-    math_questions = [
-        "Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
-        "Question: Katy makes coffee using teaspoons of sugar and cups of water in the ratio of 7:13. If she used a total of 120 teaspoons of sugar and cups of water, calculate the number of teaspoonfuls of sugar she used.",
-        "Question: A craft store makes a third of its sales in the fabric section, a quarter of its sales in the jewelry section, and the rest in the stationery section. They made 36 sales today. How many sales were in the stationery section?",
-        "Question: A ticket costs $8. There are 5 friends going to the movie. They have a coupon for $10 off the total. How much do they pay in total?",
-        "Question: In a class of 30 students, 40% are girls. How many boys are there?",
-        "Question: A recipe requires 2 cups of flour for 12 cookies. How many cups are needed for 30 cookies?",
-        "Question: Peter has $100. He buys a shirt for $25, pants for $35, and then finds $10. How much does he have left?",
-        "Question: There are 4 apples and 5 oranges in a bowl. John adds 3 more apples and twice as many oranges as the original number of apples. How many fruits are there now?",
-        "Question: A bus has 40 passengers. At the first stop, 1/5 get off and 8 get on. How many passengers are there now?",
-        "Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
-    ]
+    # Only run Sam's test scores question
+    sam_question = "Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
     
-    print("Testing Qwen2.5-7B on math problems...")
-    print("=" * 80)
-    
-    # Only run Sam's test scores question (last question, index 9)
-    question = math_questions[9]  # Index 9 is Sam's test scores
-    print(f"\nQuestion 10 (Sam's test scores):")
-    print(f"Prompt: {question}")
-    print("-" * 60)
-    
-    # Generate with 10 max tokens for testing first, then 325 for full reasoning
-    print("Testing with 10 tokens first...")
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 10, question)
-    print(f"Test output: {output}")
-    print("=" * 80)
-    
-    print("Now generating with 325 tokens for full reasoning...")
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 325, question)
+    print(f"\n{'='*80}")
+    print("Sam's Test Scores Question:")
+    print(f"Prompt: {sam_question}")
+    # Generate with 500 max tokens for thorough reasoning
+    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 500, sam_question)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
-    print("=" * 80)
+    print(f"{'='*80}")
 
 if __name__ == "__main__":
     main() 

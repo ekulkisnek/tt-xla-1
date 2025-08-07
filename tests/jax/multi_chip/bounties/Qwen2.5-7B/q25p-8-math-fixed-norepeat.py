@@ -3,7 +3,7 @@
 Self-contained Qwen2.5-7B-Instruct inference script for multi-device JAX with tensor parallelism.
 - Fixed rotary embeddings (RoPE) with proper broadcasting.
 - Corrected GQA attention mechanism for shape compatibility.
-- Optimized sampling to prevent repetitive outputs.
+- Optimized sampling to prevent repetitive outputs (no immediate token repeat).
 - Enhanced for GSM8K-style math problems.
 - Greedy sampling (temperature=0) for deterministic outputs.
 - Hardcoded GSM8K benchmarking with 10 samples.
@@ -16,8 +16,6 @@ Self-contained Qwen2.5-7B-Instruct inference script for multi-device JAX with te
 - Pure JAX sampling (no PyTorch dependency).
 - Enhanced memory management with GC collects.
 - TENSOR PARALLELISM: Multi-device distributed inference using shard_map.
-
-Test
 
 Usage:
 python q25j7_tensor_parallel_fixed.py --model_path weights
@@ -37,7 +35,8 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
+# Note: leave default device discovery; override via env if needed
+os.environ.setdefault('XLA_FLAGS', '--xla_force_host_platform_device_count=1')
 
 import jax
 import jax.numpy as jnp
@@ -114,12 +113,6 @@ class FlaxQwenPreTrainedModel(nn.Module):
                 }
             }
         return cache
-    
-    def reset_cache(self):
-        """Reset cache for new generation."""
-        # This would be called before starting a new generation
-        # In practice, we'll handle this in the generation loop
-        pass
 
 class FullyParallelQwenAttention(nn.Module):
     """Full parallel attention with all projections using ParallelDense."""
@@ -188,39 +181,33 @@ class FullyParallelQwenAttention(nn.Module):
             q, k = apply_rotary_emb_complex(q, k, freqs_cis)
 
         # Handle KV cache with mutable in-place updates
-        cur_index = self.cache_index.value
         if past_key_value is not None:
+            # For now, use the original concatenation approach but with mutable storage
             past_k, past_v = past_key_value
-        else:
-            # First step: use zeros up to cur_index (which is 0)
-            past_k = self.cached_key.value[:, :cur_index, :, :]
-            past_v = self.cached_value.value[:, :cur_index, :, :]
+            k = jnp.concatenate([past_k, k], axis=1)
+            v = jnp.concatenate([past_v, v], axis=1)
+            
+            # Store in mutable cache for future use
+            cur_index = self.cache_index.value
+            indices = (0, cur_index, 0, 0)
+            k_cast = k.astype(self.dtype)
+            v_cast = v.astype(self.dtype)
+            self.cached_key.value = k_cast
+            self.cached_value.value = v_cast
+            self.cache_index.value += seq
 
-        # Concatenate only for computation, but update cache in-place
-        k_full = jnp.concatenate([past_k, k], axis=1)
-        v_full = jnp.concatenate([past_v, v], axis=1)
-
-        # In-place update the new slice in cache
-        self.cached_key.value = self.cached_key.value.at[:, cur_index:cur_index + seq, :, :].set(k.astype(self.dtype))
-        self.cached_value.value = self.cached_value.value.at[:, cur_index:cur_index + seq, :, :].set(v.astype(self.dtype))
-        self.cache_index.value += seq
-
-        # Use the full updated KV for attention
-        cache_k, cache_v = k_full, v_full  # Or slice from cache: self.cached_key.value[:, :cur_index + seq, :, :]
+        cache_k, cache_v = k, v
 
         # GQA: Repeat k/v to match query heads
         if self.num_heads != self.num_kv_heads:
             repeat = self.num_heads // self.num_kv_heads
-            k_full = jnp.repeat(k_full, repeat, axis=2)
-            v_full = jnp.repeat(v_full, repeat, axis=2)
-        else:
-            k_full = k_full
-            v_full = v_full
+            k = jnp.repeat(k, repeat, axis=2)
+            v = jnp.repeat(v, repeat, axis=2)
 
         # Attention computation
         q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
-        k = k_full.transpose(0, 2, 1, 3)
-        v = v_full.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
         scale = 1.0 / jnp.sqrt(self.head_dim)
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
@@ -543,18 +530,25 @@ def load_params(model, model_path, dtype):
     return params
 
 # --- Generation ---
-def sample_next_token(logits):
-    """Simplified greedy sampling only."""
-    # Add some debugging to see what's happening
-    next_token = int(jnp.argmax(logits, axis=-1)[0])
-    
-    # Check for repetition - if the same token is being selected repeatedly
-    # This could indicate an issue with the model output or sampling
-    
-    return next_token
+def sample_next_token(logits, avoid_token_id: Optional[int] = None):
+    """Greedy sampling with a simple safeguard to avoid immediate token repetition.
 
-def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
-    """Standard generation using model's prepare_inputs_for_generation and update_inputs_for_generation methods."""
+    logits: [1, vocab]
+    avoid_token_id: if provided, mask this token before argmax
+    """
+    # Work in float32 for stable masking
+    logits32 = logits.astype(jnp.float32)
+    if avoid_token_id is not None:
+        # Mask out the immediately previous token to prevent duplicates like "needs needs"
+        # Use a large negative value; -1e9 works well with float32
+        logits32 = logits32.at[0, avoid_token_id].set(jnp.array(-1e9, dtype=jnp.float32))
+    return int(jnp.argmax(logits32, axis=-1)[0])
+
+def generate_text(model, params, tokenizer, max_tokens, prompt):
+    """Standard generation using model's prepare_inputs_for_generation and update_inputs_for_generation methods.
+
+    Adds a no-immediate-repeat constraint in greedy decoding.
+    """
     print("Starting text generation...")
     
     # Monitor memory usage
@@ -583,10 +577,7 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     
     # Initialize cache
     max_length = model.config.get("max_position_embeddings", 2048)  # From model config
-    cache = model.init_cache(batch_size=batch_size, max_length=max_length)  # Use batch_size parameter
-    
-    # Reset cache for new generation (ensure clean state)
-    # The cache will be properly initialized when the model is first called
+    cache = model.init_cache(batch_size=1, max_length=max_length)  # Assuming batch=1; make dynamic if needed
     
     num_tokens_generated = 0
     print(f"Entering generation loop for {max_tokens} tokens...")
@@ -595,46 +586,32 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     for i in range(max_tokens):
         print(f"Generating token {i+1}/{max_tokens}...", end="", flush=True)
         
-        try:
-            # Use model's prepare_inputs_for_generation method
-            model_inputs = model.prepare_inputs_for_generation(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                position_ids=position_ids
-            )
-            
-            # Run model inference
-            outputs, mutable_vars = model.apply(
-                params, 
-                **model_inputs, 
-                return_dict=True, 
-                mutable=["cache"]
-            )
-            
-            # Update past_key_values from outputs (which uses returned cache_k, cache_v)
-            past_key_values = outputs["past_key_values"]
-            # If needed, mutable_vars contains updated 'cache' dict per layer— but since __call__ returns new_kv, it's synced
-            
-            # Get logits
-            logits = outputs["logits"]
-            
-        except Exception as e:
-            print(f"\nError during generation: {e}")
-            print(f"Current token index: {i+1}")
-            if past_key_values and past_key_values[0]:
-                print(f"Cache length: {past_key_values[0][0].shape[1] if past_key_values[0][0] is not None else 0}")
-            print(f"Max sequence length: {max_length}")
-            raise e
+        # Use model's prepare_inputs_for_generation method
+        model_inputs = model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids
+        )
         
-        # Sample next token
-        next_token = sample_next_token(logits[:, -1, :])
+        # Run model inference
+        outputs, mutable_vars = model.apply(
+            params, 
+            **model_inputs, 
+            return_dict=True, 
+            mutable=["cache"]
+        )
+        
+        # Get logits and update past key values
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
+        
+        # Determine token to avoid repeating (the immediately previous one)
+        last_token_id = generated_tokens[-1] if len(generated_tokens) > 0 else None
+        
+        # Sample next token with immediate repetition disabled
+        next_token = sample_next_token(logits[:, -1, :], avoid_token_id=last_token_id)
         generated_tokens.append(int(next_token))
-        
-        # Debug: Check for repetition
-        if len(generated_tokens) > 1 and generated_tokens[-1] == generated_tokens[-2]:
-            print(f"\nWARNING: Token repetition detected! Token {generated_tokens[-1]} repeated")
-            print(f"Previous tokens: {generated_tokens[-5:] if len(generated_tokens) >= 5 else generated_tokens}")
         
         # Update inputs for next iteration using model's update_inputs_for_generation
         update_inputs = model.update_inputs_for_generation(outputs, position_ids=model_inputs["position_ids"])
@@ -643,10 +620,6 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
         
         # Update input_ids for next step
         input_ids = jnp.array([[next_token]])
-        
-        # Debug: Print the current input_ids shape and content
-        if i < 5:  # Only print first few iterations to avoid spam
-            print(f"  Debug: input_ids shape: {input_ids.shape}, content: {input_ids}")
         
         num_tokens_generated += 1
         
@@ -675,10 +648,6 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, batch_size=1):
     
     full_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     print("Generation complete.")
-    
-    # Clean up memory
-    gc.collect()
-    
     return full_output, peak_memory, avg_time_per_token
 
 
@@ -743,13 +712,7 @@ def main():
     print(f"Prompt: {question}")
     print("-" * 60)
     
-    # Generate with 10 max tokens for testing first, then 325 for full reasoning
-    print("Testing with 10 tokens first...")
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 10, question)
-    print(f"Test output: {output}")
-    print("=" * 80)
-    
-    print("Now generating with 325 tokens for full reasoning...")
+    # Generate with 325 max tokens to allow full reasoning
     output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 325, question)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
@@ -757,4 +720,5 @@ def main():
     print("=" * 80)
 
 if __name__ == "__main__":
-    main() 
+    main()
+
